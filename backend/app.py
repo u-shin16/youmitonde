@@ -246,7 +246,9 @@ def refine_accounts_with_authenticated_state(session, accounts, cookie_header, k
             return account
 
         if detail is None:
-            return account
+            # note.com returned 404 for this account: it's been deleted/withdrawn
+            # or otherwise no longer exists, so drop it instead of showing it.
+            return None
 
         return account if keep_account(detail) else None
 
@@ -398,6 +400,23 @@ def parse_follow_action_request():
     return cookie_header, targets, None
 
 
+def verify_action_applied(session, cookie_header, urlname, method):
+    # note.com's follow/unfollow endpoint sometimes answers a processed request
+    # with an error-looking status (rate limiting, transient 5xx). Before
+    # reporting those as failures, check whether the follow state actually
+    # changed as intended.
+    if not urlname:
+        return False
+    try:
+        detail = fetch_creator(session, urlname, headers=request_headers(cookie_header))
+    except (NoteApiError, requests.RequestException):
+        return False
+    if detail is None:
+        return False
+    expected_following = method == "POST"
+    return detail.get("isFollowing") == expected_following
+
+
 def perform_follow_action(cookie_header, targets, method):
     # NOTE: /api/v3/users/{key}/following is not officially documented by note.com.
     # Reverse-engineered from a live captured request: the path segment is the
@@ -440,7 +459,10 @@ def perform_follow_action(cookie_header, targets, method):
 
         if resp.status_code == 429:
             rate_limit_error = "note.comのレート制限に達しました。数分〜数十分単位のクールダウンが必要な場合があるので、5〜10分ほど間隔を空けて件数を減らして試してください"
-            results.append({"urlname": urlname, "success": False, "error": rate_limit_error})
+            if verify_action_applied(session, cookie_header, urlname, method):
+                results.append({"urlname": urlname, "success": True, "error": None})
+            else:
+                results.append({"urlname": urlname, "success": False, "error": rate_limit_error})
             # Once rate-limited, every remaining target will fail the same way.
             # Stop immediately instead of still waiting+trying each one.
             for remaining in targets[index + 1 :]:
@@ -456,6 +478,8 @@ def perform_follow_action(cookie_header, targets, method):
             continue
 
         ok = resp.status_code in (200, 201, 204)
+        if not ok:
+            ok = verify_action_applied(session, cookie_header, urlname, method)
         results.append(
             {
                 "urlname": urlname,

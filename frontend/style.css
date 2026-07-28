@@ -242,6 +242,11 @@ body {
   color: var(--text);
 }
 
+.section-count {
+  font-weight: normal;
+  color: var(--muted);
+}
+
 .section-header {
   display: flex;
   align-items: center;

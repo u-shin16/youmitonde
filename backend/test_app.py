@@ -409,6 +409,49 @@ class CheckEndpointTest(unittest.TestCase):
         self.assertTrue(data["toFollowBackReliable"])
         self.assertTrue(data["authenticatedCheck"])
 
+    def test_authenticated_check_drops_deleted_or_not_found_accounts(self):
+        creator = {
+            "urlname": "me",
+            "nickname": "Me",
+            "profileImageUrl": None,
+            "followingCount": 1,
+            "followerCount": 1,
+            "isMyself": False,
+        }
+        auth_creator = {**creator, "isMyself": True}
+        gone_following = {"key": "gone-following", "urlname": "gone_following", "nickname": "Gone"}
+        gone_follower = {"key": "gone-follower", "urlname": "gone_follower", "nickname": "Gone"}
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            if urlname == "me" and headers and headers.get("Cookie") == "session=ok":
+                return auth_creator
+            if urlname == "me":
+                return creator
+            # note.com 404s the per-account lookup for both candidates,
+            # simulating a deleted/withdrawn account still present in the
+            # bulk follow-list response.
+            return None
+
+        def fake_fetch_all(_session, _urlname, kind):
+            if kind == "followings":
+                return [gone_following], 1
+            return [gone_follower], 1
+
+        with patch.object(app_module, "fetch_creator", side_effect=fake_fetch_creator), patch.object(
+            app_module, "fetch_all_follows", side_effect=fake_fetch_all
+        ):
+            response = self.client.post(
+                "/api/check",
+                json={"username": "me", "cookieHeader": "session=ok"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["notFollowingBack"], [])
+        self.assertEqual(data["toFollowBack"], [])
+        self.assertTrue(data["notFollowingBackReliable"])
+        self.assertTrue(data["toFollowBackReliable"])
+
     def test_authenticated_check_removes_account_that_follows_me_back(self):
         creator = {
             "urlname": "me",
@@ -495,6 +538,105 @@ class CheckEndpointTest(unittest.TestCase):
         self.assertFalse(data["toFollowBackReliable"])
         self.assertTrue(data["toFollowBackUnavailableReason"])
         self.assertTrue(data["authWarning"])
+
+
+class FollowActionEndpointTest(unittest.TestCase):
+    def setUp(self):
+        app_module.app.config["TESTING"] = True
+        self.client = app_module.app.test_client()
+
+    def test_unfollow_confirms_success_despite_bad_status_when_state_already_changed(self):
+        class FakeResponse:
+            def __init__(self, status_code):
+                self.status_code = status_code
+
+        class FakeSession:
+            def request(self, method, url, headers=None, timeout=None):
+                # note.com occasionally answers a request it actually processed
+                # with a server-error-looking status.
+                return FakeResponse(500)
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            self.assertEqual(headers.get("Cookie"), "session=ok")
+            return {"urlname": urlname, "isFollowing": False}
+
+        with patch.object(app_module.requests, "Session", return_value=FakeSession()), patch.object(
+            app_module, "fetch_creator", side_effect=fake_fetch_creator
+        ), patch.object(app_module.time, "sleep"):
+            response = self.client.post(
+                "/api/unfollow",
+                json={"cookieHeader": "session=ok", "targets": [{"key": "k1", "urlname": "someone"}]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        results = response.get_json()["results"]
+        self.assertEqual(results, [{"urlname": "someone", "success": True, "error": None}])
+
+    def test_unfollow_reports_real_failure_when_state_did_not_change(self):
+        class FakeResponse:
+            def __init__(self, status_code):
+                self.status_code = status_code
+
+        class FakeSession:
+            def request(self, method, url, headers=None, timeout=None):
+                return FakeResponse(500)
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            return {"urlname": urlname, "isFollowing": True}
+
+        with patch.object(app_module.requests, "Session", return_value=FakeSession()), patch.object(
+            app_module, "fetch_creator", side_effect=fake_fetch_creator
+        ), patch.object(app_module.time, "sleep"):
+            response = self.client.post(
+                "/api/unfollow",
+                json={"cookieHeader": "session=ok", "targets": [{"key": "k1", "urlname": "someone"}]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        results = response.get_json()["results"]
+        self.assertFalse(results[0]["success"])
+        self.assertIn("500", results[0]["error"])
+
+    def test_unfollow_rate_limited_request_confirmed_success_but_later_targets_stay_skipped(self):
+        class FakeResponse:
+            def __init__(self, status_code):
+                self.status_code = status_code
+                self.headers = {}
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, method, url, headers=None, timeout=None):
+                self.calls += 1
+                return FakeResponse(429)
+
+        fake_session = FakeSession()
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            self.assertEqual(urlname, "first")
+            return {"urlname": urlname, "isFollowing": False}
+
+        with patch.object(app_module.requests, "Session", return_value=fake_session), patch.object(
+            app_module, "fetch_creator", side_effect=fake_fetch_creator
+        ), patch.object(app_module.time, "sleep"):
+            response = self.client.post(
+                "/api/unfollow",
+                json={
+                    "cookieHeader": "session=ok",
+                    "targets": [
+                        {"key": "k1", "urlname": "first"},
+                        {"key": "k2", "urlname": "second"},
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        results = response.get_json()["results"]
+        self.assertEqual(fake_session.calls, 1)
+        self.assertEqual(results[0], {"urlname": "first", "success": True, "error": None})
+        self.assertFalse(results[1]["success"])
+        self.assertEqual(results[1]["urlname"], "second")
 
 
 if __name__ == "__main__":

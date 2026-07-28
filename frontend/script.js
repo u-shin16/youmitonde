@@ -193,6 +193,7 @@ function createAccountPanel({
   bodyId,
   toggleId,
   listId,
+  countId,
   selectAllId,
   buttonId,
   statusId,
@@ -204,6 +205,7 @@ function createAccountPanel({
   const bodyEl = document.getElementById(bodyId);
   const toggleEl = document.getElementById(toggleId);
   const listEl = document.getElementById(listId);
+  const countEl = document.getElementById(countId);
   const selectAllEl = document.getElementById(selectAllId);
   const buttonEl = document.getElementById(buttonId);
   const panelStatusEl = document.getElementById(statusId);
@@ -327,11 +329,13 @@ function createAccountPanel({
       if (newAccounts.length === 0) {
         sectionEl.hidden = true;
         emptyEl.hidden = false;
+        countEl.textContent = "";
         return false;
       }
 
       emptyEl.hidden = true;
       sectionEl.hidden = false;
+      countEl.textContent = `（${newAccounts.length}人）`;
       listEl.innerHTML = newAccounts
         .map(
           (account) => `
@@ -355,6 +359,7 @@ function createAccountPanel({
       toggleEl.textContent = "表示する";
       listEl.innerHTML = "";
       sectionEl.hidden = true;
+      countEl.textContent = "";
       emptyEl.textContent = message;
       emptyEl.classList.add("warning");
       emptyEl.hidden = false;
@@ -369,6 +374,7 @@ function createAccountPanel({
       toggleEl.textContent = "表示する";
       listEl.innerHTML = "";
       sectionEl.hidden = true;
+      countEl.textContent = "";
       emptyEl.hidden = true;
       updateButtonState();
       return false;
@@ -383,6 +389,7 @@ const unfollowPanel = createAccountPanel({
   bodyId: "not-following-back-body",
   toggleId: "not-following-back-toggle",
   listId: "not-following-back-list",
+  countId: "not-following-back-count",
   selectAllId: "select-all-unfollow",
   buttonId: "unfollow-button",
   statusId: "unfollow-status",
@@ -396,6 +403,7 @@ const followPanel = createAccountPanel({
   bodyId: "to-follow-back-body",
   toggleId: "to-follow-back-toggle",
   listId: "to-follow-back-list",
+  countId: "to-follow-back-count",
   selectAllId: "select-all-follow",
   buttonId: "follow-button",
   statusId: "follow-status",
