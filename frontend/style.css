@@ -771,6 +771,7 @@ body {
 .legal-page p, .legal-page li { font-size: 0.9rem; }
 .legal-page ul { padding-left: 20px; }
 .legal-page a { color: var(--green-dark); }
+.legal-page a.btn { color: #fff; }
 .btn {
   display: inline-block;
   padding: 10px 18px;
