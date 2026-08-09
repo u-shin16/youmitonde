@@ -18,7 +18,9 @@ NOTE_FOLLOW_API_BASE = "https://note.com/api/v3/users"
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; YouMitonde/1.0)"}
 REQUEST_TIMEOUT = 10
 MAX_WORKERS = 5
-MAX_PAGES = 100  # safety cap against accidental/huge account lists
+MAX_FOLLOW_LIST_ITEMS = 20000  # safety cap against accidental/huge account lists, in items (not pages --
+# note.com's actual per-page size for these endpoints is undocumented and has changed before, so a fixed
+# page-count cap silently turns into a much lower item cap whenever the real page size is smaller than assumed)
 FOLLOW_LIST_PAGE_SIZE_PARAM = 100  # passing &per= at all lifts note.com's ~600-item cap on these lists
 FOLLOW_ACTION_DELAY_SECONDS = 2.5  # note.com 429s a burst of follow/unfollow calls; space them out
 MAX_FOLLOW_ACTION_TARGETS = 200  # guard against accidental/huge batch requests
@@ -172,7 +174,8 @@ def fetch_all_follows(session, urlname, kind):
         return follows, total
 
     page_size = len(follows)
-    total_pages = min(-(-total // page_size), MAX_PAGES)  # ceil division, safety-capped
+    max_pages_for_item_cap = -(-MAX_FOLLOW_LIST_ITEMS // page_size)  # ceil division
+    total_pages = min(-(-total // page_size), max_pages_for_item_cap)  # ceil division, safety-capped
     results = {1: follows}
 
     def worker(page):

@@ -253,6 +253,41 @@ class CheckEndpointTest(unittest.TestCase):
         self.assertEqual(total, 4)
         self.assertEqual(sorted(f["urlname"] for f in follows), ["p1", "p2", "p3", "p4"])
 
+    def test_fetch_all_follows_is_not_capped_when_notes_real_page_size_is_small(self):
+        # note.com's actual per-page size for these endpoints is undocumented
+        # and has changed before; the safety net used to be a fixed page-count
+        # cap (MAX_PAGES), which silently turned into a much lower item cap
+        # whenever the real page size came back smaller than assumed -- e.g.
+        # a page size of 10 with a 100-page cap silently ceilinged every
+        # account at exactly 1000 items. It must now scale with the real
+        # (small) page size instead of capping prematurely.
+        page_size = 10
+        total = 1374
+
+        class PagedResponse:
+            def __init__(self, follows, is_last):
+                self.status_code = 200
+                self.headers = {}
+                self._follows = follows
+                self._is_last = is_last
+
+            def json(self):
+                return {"data": {"follows": self._follows, "totalCount": total, "isLastPage": self._is_last}}
+
+        class SmallPageSession:
+            def get(self, _url, params=None, **_kwargs):
+                page = params["page"]
+                start = (page - 1) * page_size
+                end = min(start + page_size, total)
+                follows = [{"urlname": f"u{i}"} for i in range(start, end)]
+                return PagedResponse(follows, end >= total)
+
+        with patch.object(app_module.time, "sleep"):
+            follows, fetched_total = app_module.fetch_all_follows(SmallPageSession(), "me", "followers")
+
+        self.assertEqual(fetched_total, total)
+        self.assertEqual(len(follows), total)
+
     def test_follow_back_candidates_use_account_key_before_urlname(self):
         creator = {
             "urlname": "me",
