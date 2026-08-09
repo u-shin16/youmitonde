@@ -144,8 +144,30 @@ def fetch_follow_page(session, urlname, kind, page):
     return data.get("follows", []), data.get("totalCount", 0), data.get("isLastPage", True)
 
 
+FOLLOW_PAGE_RETRY_BACKOFF_SECONDS = (1.0, 3.0, 6.0)  # extra retries for a single page within a bulk fetch
+
+
+def fetch_follow_page_resilient(session, urlname, kind, page):
+    # A bulk fetch spanning many pages (e.g. 1000+ followers needs ~50 requests
+    # at FOLLOW_LIST_PAGE_SIZE_PARAM items each) is far more likely to have at
+    # least one page transiently fail than a single request is. fetch_follow_page
+    # already retries transient statuses a couple of times with short delays;
+    # this adds a slower outer retry so one flaky page doesn't abort the whole
+    # list and make it look like the account "can't be fetched" once it grows
+    # past a few hundred follows/followers.
+    last_error = None
+    for delay in (0.0, *FOLLOW_PAGE_RETRY_BACKOFF_SECONDS):
+        if delay:
+            time.sleep(delay)
+        try:
+            return fetch_follow_page(session, urlname, kind, page)
+        except NoteApiError as exc:
+            last_error = exc
+    raise last_error
+
+
 def fetch_all_follows(session, urlname, kind):
-    follows, total, is_last = fetch_follow_page(session, urlname, kind, 1)
+    follows, total, is_last = fetch_follow_page_resilient(session, urlname, kind, 1)
     if is_last or not follows:
         return follows, total
 
@@ -155,7 +177,7 @@ def fetch_all_follows(session, urlname, kind):
 
     def worker(page):
         time.sleep(0.05)
-        items, _, _ = fetch_follow_page(session, urlname, kind, page)
+        items, _, _ = fetch_follow_page_resilient(session, urlname, kind, page)
         return page, items
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:

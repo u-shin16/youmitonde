@@ -156,6 +156,103 @@ class CheckEndpointTest(unittest.TestCase):
         self.assertEqual(context.exception.status, 502)
         self.assertIn("応答を読み取れませんでした", context.exception.message)
 
+    def test_fetch_follow_page_resilient_recovers_beyond_the_inner_retry_budget(self):
+        # fetch_follow_page itself only retries transient statuses twice
+        # (3 attempts total). This exercises a page that keeps failing past
+        # that budget but recovers within the outer resilient retry, which is
+        # exactly the kind of flakiness a 1000+ item bulk fetch (many pages,
+        # more chances for one to be unlucky) needs to survive.
+        class FlakyResponse:
+            def __init__(self, status_code):
+                self.status_code = status_code
+                self.headers = {}
+
+            def json(self):
+                return {"data": {"follows": [{"urlname": "x"}], "totalCount": 1, "isLastPage": True}}
+
+        class FlakySession:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, *_args, **_kwargs):
+                self.calls += 1
+                return FlakyResponse(503 if self.calls <= 5 else 200)
+
+        session = FlakySession()
+        with patch.object(app_module.time, "sleep"):
+            follows, total, is_last = app_module.fetch_follow_page_resilient(session, "me", "followings", 1)
+
+        self.assertEqual(follows, [{"urlname": "x"}])
+        self.assertEqual(total, 1)
+        self.assertTrue(is_last)
+        self.assertEqual(session.calls, 6)
+
+    def test_fetch_follow_page_resilient_gives_up_after_exhausting_all_retries(self):
+        class AlwaysBusyResponse:
+            status_code = 503
+            headers = {}
+
+        class AlwaysBusySession:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, *_args, **_kwargs):
+                self.calls += 1
+                return AlwaysBusyResponse()
+
+        session = AlwaysBusySession()
+        expected_calls = (len(app_module.FOLLOW_PAGE_RETRY_BACKOFF_SECONDS) + 1) * (
+            len(app_module.RATE_LIMIT_RETRY_DELAYS_SECONDS) + 1
+        )
+        with patch.object(app_module.time, "sleep"):
+            with self.assertRaises(app_module.NoteApiError) as context:
+                app_module.fetch_follow_page_resilient(session, "me", "followings", 1)
+
+        self.assertEqual(session.calls, expected_calls)
+        self.assertEqual(context.exception.status, 503)
+
+    def test_fetch_all_follows_survives_one_flaky_page_among_many(self):
+        # Page 1 reports enough total items to need several more pages; page 3
+        # is flaky beyond fetch_follow_page's own retry budget but recovers
+        # within fetch_all_follows's per-page resilience, so the whole list
+        # still comes back complete instead of the request failing outright.
+        class PagedResponse:
+            def __init__(self, follows, total, is_last):
+                self.status_code = 200
+                self.headers = {}
+                self._follows = follows
+                self._total = total
+                self._is_last = is_last
+
+            def json(self):
+                return {"data": {"follows": self._follows, "totalCount": self._total, "isLastPage": self._is_last}}
+
+        class BusyResponse:
+            status_code = 503
+            headers = {}
+
+        class FlakyPagedSession:
+            def __init__(self):
+                self.page3_calls = 0
+
+            def get(self, _url, params=None, **_kwargs):
+                page = params["page"]
+                if page == 1:
+                    return PagedResponse([{"urlname": "p1"}], 4, False)
+                if page == 3:
+                    self.page3_calls += 1
+                    if self.page3_calls <= 3:
+                        return BusyResponse()
+                    return PagedResponse([{"urlname": "p3"}], 4, False)
+                return PagedResponse([{"urlname": f"p{page}"}], 4, page == 4)
+
+        session = FlakyPagedSession()
+        with patch.object(app_module.time, "sleep"):
+            follows, total = app_module.fetch_all_follows(session, "me", "followings")
+
+        self.assertEqual(total, 4)
+        self.assertEqual(sorted(f["urlname"] for f in follows), ["p1", "p2", "p3", "p4"])
+
     def test_follow_back_candidates_use_account_key_before_urlname(self):
         creator = {
             "urlname": "me",

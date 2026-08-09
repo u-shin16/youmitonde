@@ -15,10 +15,18 @@ const toastEl = document.getElementById("toast");
 const REQUIRED_COOKIE_MESSAGE = "アカウントチェックにはnote.comのCookie文字列が必要です";
 const CHECK_COOLDOWN_AFTER_ACTION_SECONDS = 90;
 const RATE_LIMIT_FALLBACK_COOLDOWN_SECONDS = 90;
+const FOLLOW_ACTION_BATCH_SIZE = 20; // 大量選択でも一気に送らず段階的に処理する
+const FOLLOW_ACTION_BATCH_PAUSE_SECONDS = 3; // バッチ間の間隔（レート制限自体は未検知でも空ける）
+const FOLLOW_ACTION_RATE_LIMIT_COOLDOWN_SECONDS = 90; // レート制限検知後、再試行までのクールダウン
+const FOLLOW_ACTION_MAX_RETRY_ROUNDS = 2; // レート制限からの自動再試行の最大回数
 let isChecking = false;
 let checkCooldownUntil = 0;
 let checkCooldownTimer = null;
 let toastTimer = null;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 cookieHelpToggle.addEventListener("click", () => {
   cookieHelpBody.hidden = !cookieHelpBody.hidden;
@@ -260,35 +268,21 @@ function createAccountPanel({
     if (targets.length === 0) return;
 
     const confirmed = await showConfirm(
-      `${targets.length}件を${actionVerb}します。よろしいですか？\n（note.com非公式の仕組みを使っているため、失敗する場合もあります）`
+      `${targets.length}件を${actionVerb}します。よろしいですか？\n（note.com非公式の仕組みを使っているため、失敗する場合もあります。件数が多い時は自動的に段階的に処理します）`
     );
     if (!confirmed) return;
 
     buttonEl.disabled = true;
     panelStatusEl.hidden = false;
     panelStatusEl.className = "status";
-    panelStatusEl.textContent = `処理中…（${targets.length}件）`;
+    panelStatusEl.textContent = `処理中…（0/${targets.length}件）`;
     beginAction(actionType);
 
     try {
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cookieHeader: cookieInput.value.trim(), targets }),
-      });
-      const data = await res.json();
-
-      if (!res.ok) {
-        panelStatusEl.className = "status error";
-        panelStatusEl.textContent = data.error || `${actionVerb}に失敗しました`;
-        return;
-      }
-
-      applyResults(data.results);
-      const successCount = data.results.filter((r) => r.success).length;
+      const { successCount, totalCount } = await runFollowActionInBatches(targets);
       if (successCount > 0) startCheckCooldown();
       panelStatusEl.className = "status";
-      panelStatusEl.textContent = `${successCount}/${data.results.length}件の${actionVerb}に成功しました。再チェックは少し待ってからできます`;
+      panelStatusEl.textContent = `${successCount}/${totalCount}件の${actionVerb}に成功しました。再チェックは少し待ってからできます`;
     } catch (err) {
       panelStatusEl.className = "status error";
       panelStatusEl.textContent = "通信に失敗しました。時間をおいてもう一度お試しください";
@@ -296,6 +290,74 @@ function createAccountPanel({
       endAction();
     }
   });
+
+  // 一気に全件送るとnote.comのレート制限に引っかかりやすく、大量選択時は
+  // 途中から一律失敗になりがちだった。少数ずつ間隔を空けて送り、レート制限に
+  // 引っかかった分だけクールダウン後に自動で再試行することで、大量選択でも
+  // 段階的に、粘り強く処理する。
+  async function runFollowActionInBatches(targets) {
+    const finalResults = new Map(); // urlname -> 最新の結果
+    let pending = targets;
+    let round = 0;
+
+    while (pending.length > 0 && round <= FOLLOW_ACTION_MAX_RETRY_ROUNDS) {
+      if (round > 0) {
+        panelStatusEl.textContent =
+          `レート制限を検知したため、${FOLLOW_ACTION_RATE_LIMIT_COOLDOWN_SECONDS}秒待ってから` +
+          `残り${pending.length}件を再試行します…`;
+        await sleep(FOLLOW_ACTION_RATE_LIMIT_COOLDOWN_SECONDS * 1000);
+      }
+
+      const rateLimited = [];
+      for (let i = 0; i < pending.length; i += FOLLOW_ACTION_BATCH_SIZE) {
+        const batch = pending.slice(i, i + FOLLOW_ACTION_BATCH_SIZE);
+        panelStatusEl.textContent = `処理中…（${finalResults.size}/${targets.length}件完了）`;
+
+        let res, data;
+        try {
+          res = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cookieHeader: cookieInput.value.trim(), targets: batch }),
+          });
+          data = await res.json();
+        } catch (err) {
+          batch.forEach((t) =>
+            finalResults.set(t.urlname, { urlname: t.urlname, success: false, error: "通信に失敗しました" })
+          );
+          applyResults(batch.map((t) => finalResults.get(t.urlname)));
+          pending = [];
+          break;
+        }
+
+        if (!res.ok) {
+          const message = data.error || `${actionVerb}に失敗しました`;
+          batch.forEach((t) => finalResults.set(t.urlname, { urlname: t.urlname, success: false, error: message }));
+          applyResults(batch.map((t) => finalResults.get(t.urlname)));
+          pending = [];
+          break;
+        }
+
+        data.results.forEach((result) => {
+          finalResults.set(result.urlname, result);
+          if (!result.success && (result.error || "").includes("レート制限")) {
+            const target = batch.find((t) => t.urlname === result.urlname);
+            if (target) rateLimited.push(target);
+          }
+        });
+        applyResults(data.results);
+
+        const isLastBatch = i + FOLLOW_ACTION_BATCH_SIZE >= pending.length;
+        if (!isLastBatch) await sleep(FOLLOW_ACTION_BATCH_PAUSE_SECONDS * 1000);
+      }
+
+      pending = rateLimited;
+      round += 1;
+    }
+
+    const results = [...finalResults.values()];
+    return { successCount: results.filter((r) => r.success).length, totalCount: targets.length };
+  }
 
   function applyResults(results) {
     results.forEach((result) => {
