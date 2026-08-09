@@ -174,25 +174,40 @@ def fetch_all_follows(session, urlname, kind):
         return follows, total
 
     page_size = len(follows)
-    max_pages_for_item_cap = -(-MAX_FOLLOW_LIST_ITEMS // page_size)  # ceil division
-    total_pages = min(-(-total // page_size), max_pages_for_item_cap)  # ceil division, safety-capped
+    max_pages = max(1, -(-MAX_FOLLOW_LIST_ITEMS // page_size))  # ceil division, item-count safety cap
     results = {1: follows}
 
     def worker(page):
         time.sleep(0.05)
-        items, _, _ = fetch_follow_page_resilient(session, urlname, kind, page)
-        return page, items
+        return fetch_follow_page_resilient(session, urlname, kind, page)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(worker, page) for page in range(2, total_pages + 1)]
-        for future in as_completed(futures):
-            page, items = future.result()
-            results[page] = items
+    # note.com's reported totalCount for these lists has been wrong/capped
+    # before (independently of any pagination trick -- see the 600-item-cap
+    # fix above), so it's only used to size the first parallel batch of
+    # requests. The real stopping condition is each page's own isLastPage
+    # flag (or an empty page), never a page count derived from totalCount --
+    # otherwise a stale/capped totalCount silently truncates the whole list
+    # even though more pages genuinely exist.
+    next_page = 2
+    wave_end = min(max(-(-total // page_size), next_page), max_pages)
+    reached_end = False
+
+    while next_page <= max_pages and not reached_end:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(worker, page): page for page in range(next_page, wave_end + 1)}
+            for future in as_completed(futures):
+                page = futures[future]
+                items, _, page_is_last = future.result()
+                results[page] = items
+                if page_is_last or not items:
+                    reached_end = True
+        next_page = wave_end + 1
+        wave_end = min(next_page + MAX_WORKERS - 1, max_pages)
 
     all_follows = []
     for page in sorted(results):
         all_follows.extend(results[page])
-    return all_follows, total
+    return all_follows, max(total, len(all_follows))
 
 
 def to_account(entry):

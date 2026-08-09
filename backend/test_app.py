@@ -288,6 +288,43 @@ class CheckEndpointTest(unittest.TestCase):
         self.assertEqual(fetched_total, total)
         self.assertEqual(len(follows), total)
 
+    def test_fetch_all_follows_keeps_going_when_notes_totalcount_undercounts(self):
+        # note.com's reported totalCount itself has been observed to be wrong
+        # (capped independently of pagination), not just the page count -- a
+        # page range computed purely from totalCount would stop right where
+        # totalCount says to, even though isLastPage keeps reporting False
+        # past that point. The real total (and every page's isLastPage flag)
+        # must win over a stale/wrong totalCount.
+        page_size = 10
+        reported_total = 1000  # what note.com claims on page 1 (wrong/capped)
+        real_total = 1374  # what actually exists and keeps coming back
+
+        class PagedResponse:
+            def __init__(self, follows, is_last):
+                self.status_code = 200
+                self.headers = {}
+                self._follows = follows
+                self._is_last = is_last
+
+            def json(self):
+                return {
+                    "data": {"follows": self._follows, "totalCount": reported_total, "isLastPage": self._is_last}
+                }
+
+        class UndercountingSession:
+            def get(self, _url, params=None, **_kwargs):
+                page = params["page"]
+                start = (page - 1) * page_size
+                end = min(start + page_size, real_total)
+                follows = [{"urlname": f"u{i}"} for i in range(start, end)]
+                return PagedResponse(follows, end >= real_total)
+
+        with patch.object(app_module.time, "sleep"):
+            follows, fetched_total = app_module.fetch_all_follows(UndercountingSession(), "me", "followers")
+
+        self.assertEqual(len(follows), real_total)
+        self.assertEqual(fetched_total, real_total)
+
     def test_follow_back_candidates_use_account_key_before_urlname(self):
         creator = {
             "urlname": "me",
