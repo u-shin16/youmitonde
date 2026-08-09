@@ -490,6 +490,54 @@ class CheckEndpointTest(unittest.TestCase):
         self.assertTrue(data["notFollowingBackReliable"])
         self.assertEqual(data["notFollowingBack"], [])
 
+    def test_authenticated_own_account_check_uses_uncapped_v3_endpoint(self):
+        # When checking your own account (authenticated_check True) and the
+        # creator payload includes a "key", note.com's own web UI uses the
+        # v3 endpoint instead of the public v2/creators one -- which has its
+        # own undocumented item cap that `per` doesn't lift. This should be
+        # preferred and should not report the account as capped even though
+        # the public list (fetch_all_follows) would have looked capped.
+        creator = {
+            "urlname": "me",
+            "nickname": "Me",
+            "profileImageUrl": None,
+            "followingCount": 0,
+            "followerCount": 1178,
+            "isMyself": False,
+            "key": "my-key",
+        }
+        auth_creator = {**creator, "isMyself": True}
+        followers = [{"key": f"follower-{i}", "urlname": f"follower_{i}"} for i in range(1178)]
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            if urlname == "me" and headers and headers.get("Cookie") == "session=ok":
+                return auth_creator
+            if urlname == "me":
+                return creator
+            return None
+
+        def fake_fetch_all_v3(_session, key, kind, _cookie_header):
+            self.assertEqual(key, "my-key")
+            if kind == "followings":
+                return [], 0
+            return followers, len(followers)
+
+        def unexpectedly_called_v2(*_args, **_kwargs):
+            raise AssertionError("fetch_all_follows (v2) should not be used when the v3 path is available")
+
+        with patch.object(app_module, "fetch_creator", side_effect=fake_fetch_creator), patch.object(
+            app_module, "fetch_all_follows_v3", side_effect=fake_fetch_all_v3
+        ), patch.object(app_module, "fetch_all_follows", side_effect=unexpectedly_called_v2):
+            response = self.client.post(
+                "/api/check",
+                json={"username": "me", "cookieHeader": "session=ok"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data["capped"])
+        self.assertEqual(data["checkedFollowerCount"], 1178)
+
     def test_authenticated_check_removes_already_followed_candidate(self):
         creator = {
             "urlname": "me",

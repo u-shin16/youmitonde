@@ -22,6 +22,7 @@ MAX_FOLLOW_LIST_ITEMS = 20000  # safety cap against accidental/huge account list
 # note.com's actual per-page size for these endpoints is undocumented and has changed before, so a fixed
 # page-count cap silently turns into a much lower item cap whenever the real page size is smaller than assumed)
 FOLLOW_LIST_PAGE_SIZE_PARAM = 100  # passing &per= at all lifts note.com's ~600-item cap on these lists
+NOTE_V3_USER_LIST_PAGE_SIZE = 20  # observed from note.com's own web UI
 FOLLOW_ACTION_DELAY_SECONDS = 2.5  # note.com 429s a burst of follow/unfollow calls; space them out
 MAX_FOLLOW_ACTION_TARGETS = 200  # guard against accidental/huge batch requests
 AUTH_VERIFY_WORKERS = 4
@@ -210,13 +211,96 @@ def fetch_all_follows(session, urlname, kind):
     return all_follows, max(total, len(all_follows))
 
 
+# NOTE_API_BASE (/api/v2/creators/{urlname}/followers|followings) is the public,
+# unauthenticated endpoint and has its own undocumented item cap (originally 600,
+# now observed at ~1000) that the `per` param workaround above does not lift.
+# When the request is authenticated as the very account being checked (the
+# common case: a user checking their own follow lists), note.com's own web UI
+# instead calls /api/v3/users/{key}/followers|followings -- the same
+# NOTE_FOLLOW_API_BASE family already used for follow/unfollow -- which returns
+# the real, uncapped total. Its response shape uses snake_case fields
+# (total_count / is_last_page), unlike the v2 endpoint's camelCase.
+def fetch_follow_page_v3(session, key, kind, page, cookie_header):
+    headers = {
+        **REQUEST_HEADERS,
+        "X-Requested-With": "XMLHttpRequest",
+        "Cookie": cookie_header,
+    }
+    resp = request_with_retries(
+        session,
+        f"{NOTE_FOLLOW_API_BASE}/{key}/{kind}",
+        params={"page": page, "per": NOTE_V3_USER_LIST_PAGE_SIZE},
+        headers=headers,
+    )
+    raise_for_transient_status(resp)
+    if resp.status_code != 200:
+        raise NoteApiError(f"{kind}の取得に失敗しました（status {resp.status_code}）")
+    data = note_json(resp, kind).get("data")
+    if isinstance(data, list):
+        return [], 0, True
+    if not isinstance(data, dict):
+        raise NoteApiError(
+            f"{kind}の応答形式が想定外でした。時間をおいてもう一度お試しください。"
+        )
+    return data.get("follows", []), data.get("total_count", 0), data.get("is_last_page", True)
+
+
+def fetch_follow_page_v3_resilient(session, key, kind, page, cookie_header):
+    last_error = None
+    for delay in (0.0, *FOLLOW_PAGE_RETRY_BACKOFF_SECONDS):
+        if delay:
+            time.sleep(delay)
+        try:
+            return fetch_follow_page_v3(session, key, kind, page, cookie_header)
+        except NoteApiError as exc:
+            last_error = exc
+    raise last_error
+
+
+def fetch_all_follows_v3(session, key, kind, cookie_header):
+    follows, total, is_last = fetch_follow_page_v3_resilient(session, key, kind, 1, cookie_header)
+    if is_last or not follows:
+        return follows, total
+
+    page_size = len(follows)
+    max_pages = max(1, -(-MAX_FOLLOW_LIST_ITEMS // page_size))
+    results = {1: follows}
+
+    def worker(page):
+        time.sleep(0.05)
+        return fetch_follow_page_v3_resilient(session, key, kind, page, cookie_header)
+
+    next_page = 2
+    wave_end = min(max(-(-total // page_size), next_page), max_pages)
+    reached_end = False
+
+    while next_page <= max_pages and not reached_end:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(worker, page): page for page in range(next_page, wave_end + 1)}
+            for future in as_completed(futures):
+                page = futures[future]
+                items, _, page_is_last = future.result()
+                results[page] = items
+                if page_is_last or not items:
+                    reached_end = True
+        next_page = wave_end + 1
+        wave_end = min(next_page + MAX_WORKERS - 1, max_pages)
+
+    all_follows = []
+    for page in sorted(results):
+        all_follows.extend(results[page])
+    return all_follows, max(total, len(all_follows))
+
+
 def to_account(entry):
     urlname = entry.get("urlname")
     return {
         "key": entry.get("key"),
         "urlname": urlname,
         "name": entry.get("nickname") or entry.get("name") or urlname,
-        "profileImage": entry.get("userProfileImagePath"),
+        # v2 (/api/v2/creators/.../followers) uses camelCase; v3
+        # (/api/v3/users/.../followers) uses snake_case for the same field.
+        "profileImage": entry.get("userProfileImagePath") or entry.get("user_profile_image_path"),
         "noteUrl": f"https://note.com/{urlname}",
     }
 
@@ -344,8 +428,19 @@ def check():
         if creator is None:
             return jsonify({"error": f"ユーザー「{urlname}」が見つかりませんでした"}), 404
 
-        followings, followings_total = fetch_all_follows(session, urlname, "followings")
-        followers, followers_total = fetch_all_follows(session, urlname, "followers")
+        authenticated_check = cookie_matches_creator(session, urlname, cookie_header)
+        creator_key = creator.get("key")
+        if authenticated_check and creator_key:
+            # The public v2/creators endpoint has its own undocumented item
+            # cap that the `per` param doesn't lift. When checking your own
+            # account (the common case here), note.com's own web UI instead
+            # calls this authenticated v3 endpoint, which returns the real,
+            # uncapped total.
+            followings, followings_total = fetch_all_follows_v3(session, creator_key, "followings", cookie_header)
+            followers, followers_total = fetch_all_follows_v3(session, creator_key, "followers", cookie_header)
+        else:
+            followings, followings_total = fetch_all_follows(session, urlname, "followings")
+            followers, followers_total = fetch_all_follows(session, urlname, "followers")
     except NoteApiError as exc:
         return note_error_response(exc)
     except requests.RequestException:
@@ -356,7 +451,6 @@ def check():
     following_count = creator.get("followingCount") or 0
     followers_capped = follower_count > 0 and follower_count > followers_total
     followings_capped = following_count > 0 and following_count > followings_total
-    authenticated_check = cookie_matches_creator(session, urlname, cookie_header)
     auth_warning = None
     to_follow_back_unavailable_reason = None
 
