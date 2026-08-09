@@ -16,7 +16,9 @@ const REQUIRED_COOKIE_MESSAGE = "アカウントチェックにはnote.comのCoo
 const CHECK_COOLDOWN_AFTER_ACTION_SECONDS = 90;
 const RATE_LIMIT_FALLBACK_COOLDOWN_SECONDS = 90;
 const FOLLOW_ACTION_BATCH_SIZE = 20; // 大量選択でも一気に送らず段階的に処理する
-const FOLLOW_ACTION_BATCH_PAUSE_SECONDS = 3; // バッチ間の間隔（レート制限自体は未検知でも空ける）
+const FOLLOW_ACTION_BATCH_PAUSE_SECONDS = 15; // バッチ間の間隔（レート制限自体は未検知でも空ける。
+// note.com前段のCloudFrontが約20件の連続リクエストでこちらのIPごとブロックすることが確認できたため、
+// バッチ間はより長めに空けている）
 const FOLLOW_ACTION_RATE_LIMIT_COOLDOWN_SECONDS = 90; // レート制限検知後、再試行までのクールダウン
 const FOLLOW_ACTION_MAX_RETRY_ROUNDS = 2; // レート制限からの自動再試行の最大回数
 let isChecking = false;

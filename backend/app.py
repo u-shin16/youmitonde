@@ -23,7 +23,10 @@ MAX_FOLLOW_LIST_ITEMS = 20000  # safety cap against accidental/huge account list
 # page-count cap silently turns into a much lower item cap whenever the real page size is smaller than assumed)
 FOLLOW_LIST_PAGE_SIZE_PARAM = 100  # passing &per= at all lifts note.com's ~600-item cap on these lists
 NOTE_V3_USER_LIST_PAGE_SIZE = 20  # observed from note.com's own web UI
-FOLLOW_ACTION_DELAY_SECONDS = 2.5  # note.com 429s a burst of follow/unfollow calls; space them out
+FOLLOW_ACTION_DELAY_SECONDS = 4.0  # note.com 429s a burst of follow/unfollow calls; space them out
+# (CloudFront in front of note.com has also been observed to hard-block this server's IP entirely
+# after ~20 sequential follow/unfollow calls at the old 2.5s spacing -- see is_cloudfront_block_response)
+CLOUDFRONT_BLOCK_MARKER = "The request could not be satisfied"
 MAX_FOLLOW_ACTION_TARGETS = 200  # guard against accidental/huge batch requests
 AUTH_VERIFY_WORKERS = 4
 RATE_LIMIT_RETRY_DELAYS_SECONDS = (1.0, 2.0)
@@ -105,12 +108,25 @@ def request_with_retries(session, url, params=None, headers=None):
     return resp
 
 
+def is_cloudfront_block_response(resp):
+    # A generic CloudFront error page (not a note.com application response),
+    # returned once this server's requests get hard-blocked for a while.
+    return CLOUDFRONT_BLOCK_MARKER in (resp.text or "")[:500]
+
+
 def raise_for_transient_status(resp):
     if resp.status_code == 429:
         raise NoteApiError(
             RATE_LIMIT_ERROR_MESSAGE,
             status=429,
             retry_after=parse_retry_after(resp.headers.get("Retry-After")),
+        )
+    if resp.status_code == 403 and is_cloudfront_block_response(resp):
+        raise NoteApiError(
+            "note.com側のアクセス制限（一時的なブロック）にかかっています。"
+            "30分〜1時間ほど間隔を空けてから再度お試しください。",
+            status=403,
+            retry_after=RATE_LIMIT_RETRY_AFTER_SECONDS,
         )
     if resp.status_code in (502, 503, 504):
         raise NoteApiError(SERVER_BUSY_ERROR_MESSAGE, status=503, retry_after=RATE_LIMIT_RETRY_AFTER_SECONDS)
@@ -605,16 +621,26 @@ def perform_follow_action(cookie_header, targets, method):
                 )
             break
 
+        if resp.status_code == 403 and is_cloudfront_block_response(resp):
+            # note.com sits behind CloudFront, which starts hard-blocking this
+            # server's requests (a generic CloudFront error page, not a
+            # note.com-level response) once too many requests land in a short
+            # window -- observed after ~20 sequential follow/unfollow calls.
+            # Every remaining target would fail the same way, so stop instead
+            # of hammering an endpoint that's already blocking us (which only
+            # prolongs the block) and dumping the same raw HTML into every row.
+            block_error = (
+                "note.com側のアクセス制限に達したため、これ以降の処理を中断しました。"
+                "30分〜1時間ほど間隔を空けてから、件数を減らして再度お試しください。"
+            )
+            results.append({"urlname": urlname, "success": False, "error": block_error})
+            for remaining in targets[index + 1 :]:
+                results.append({"urlname": remaining.get("urlname"), "success": False, "error": block_error})
+            break
+
         if resp.status_code in (401, 403):
-            # TEMPORARY: include note.com's actual response so we can diagnose why
-            # this is failing even with a fresh cookie. Remove once resolved.
-            body_snippet = (resp.text or "")[:300]
             results.append(
-                {
-                    "urlname": urlname,
-                    "success": False,
-                    "error": f"認証に失敗しました（status {resp.status_code}）: {body_snippet}",
-                }
+                {"urlname": urlname, "success": False, "error": "認証に失敗しました。Cookieが正しいか確認してください"}
             )
             continue
 

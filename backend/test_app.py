@@ -855,6 +855,91 @@ class FollowActionEndpointTest(unittest.TestCase):
         self.assertFalse(results[1]["success"])
         self.assertEqual(results[1]["urlname"], "second")
 
+    def test_unfollow_stops_immediately_on_cloudfront_block(self):
+        # CloudFront in front of note.com has been observed to hard-block this
+        # server after a burst of follow/unfollow calls, returning its own
+        # generic error page (not a note.com response) for every subsequent
+        # request. Continuing to hammer it would only prolong the block and
+        # would dump the same raw HTML into every remaining result, so this
+        # must stop immediately like the 429 case does.
+        class CloudFrontBlockResponse:
+            status_code = 403
+            headers = {}
+            text = (
+                '<HTML><HEAD><TITLE>ERROR: The request could not be satisfied</TITLE></HEAD>'
+                '<BODY><H1>403 ERROR</H1></BODY></HTML>'
+            )
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, method, url, headers=None, timeout=None):
+                self.calls += 1
+                return CloudFrontBlockResponse()
+
+        fake_session = FakeSession()
+
+        with patch.object(app_module.requests, "Session", return_value=fake_session), patch.object(
+            app_module.time, "sleep"
+        ):
+            response = self.client.post(
+                "/api/unfollow",
+                json={
+                    "cookieHeader": "session=ok",
+                    "targets": [
+                        {"key": "k1", "urlname": "first"},
+                        {"key": "k2", "urlname": "second"},
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        results = response.get_json()["results"]
+        # Only the first target's request should actually be attempted.
+        self.assertEqual(fake_session.calls, 1)
+        self.assertFalse(results[0]["success"])
+        self.assertFalse(results[1]["success"])
+        self.assertNotIn("<HTML>", results[0]["error"])
+        self.assertIn("アクセス制限", results[0]["error"])
+        self.assertEqual(results[0]["error"], results[1]["error"])
+
+    def test_unfollow_reports_plain_403_without_stopping_other_targets(self):
+        # A genuine (non-CloudFront) 401/403 is a per-account auth problem,
+        # not a blanket block, so it should not stop the remaining targets.
+        class PlainForbiddenResponse:
+            status_code = 403
+            headers = {}
+            text = "Forbidden"
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, method, url, headers=None, timeout=None):
+                self.calls += 1
+                return PlainForbiddenResponse()
+
+        fake_session = FakeSession()
+
+        with patch.object(app_module.requests, "Session", return_value=fake_session), patch.object(
+            app_module.time, "sleep"
+        ):
+            response = self.client.post(
+                "/api/unfollow",
+                json={
+                    "cookieHeader": "session=ok",
+                    "targets": [
+                        {"key": "k1", "urlname": "first"},
+                        {"key": "k2", "urlname": "second"},
+                    ],
+                },
+            )
+
+        results = response.get_json()["results"]
+        self.assertEqual(fake_session.calls, 2)
+        self.assertIn("Cookieが正しいか確認", results[0]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
