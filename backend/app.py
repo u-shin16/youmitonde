@@ -606,8 +606,15 @@ def perform_follow_action(cookie_header, targets, method):
             break
 
         if resp.status_code in (401, 403):
+            # TEMPORARY: include note.com's actual response so we can diagnose why
+            # this is failing even with a fresh cookie. Remove once resolved.
+            body_snippet = (resp.text or "")[:300]
             results.append(
-                {"urlname": urlname, "success": False, "error": "認証に失敗しました。Cookieが正しいか確認してください"}
+                {
+                    "urlname": urlname,
+                    "success": False,
+                    "error": f"認証に失敗しました（status {resp.status_code}）: {body_snippet}",
+                }
             )
             continue
 
