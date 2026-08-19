@@ -138,6 +138,53 @@ class CheckEndpointTest(unittest.TestCase):
         self.assertEqual(total, 0)
         self.assertTrue(is_last)
 
+    def test_v3_list_short_of_reported_total_is_capped_and_scoped(self):
+        # note.comの認証済みv3は「総数1629」と正しく返しながら、実際には1000件で
+        # 打ち切って返すことがある。以前の判定は「プロフィール件数 vs 申告総数」
+        # だけを見ていたため、これを「全部取れた」と誤判定し、1000件中の結果を
+        # 1629件中の結果であるかのように表示していた（フォロー中1629・フォロワー1593
+        # なのに片思い33人＝相互1596人という、フォロワー数を超える矛盾が出ていた）。
+        creator = {
+            "urlname": "me",
+            "nickname": "Me",
+            "profileImageUrl": None,
+            "followingCount": 1629,
+            "followerCount": 1593,
+            "isMyself": True,
+            "key": "creator-key",
+        }
+        followings = [{"key": f"f-{i}", "urlname": f"f_{i}", "nickname": f"F{i}"} for i in range(1000)]
+        followers = [{"key": f"b-{i}", "urlname": f"b_{i}", "nickname": f"B{i}"} for i in range(1000)]
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            if urlname == "me":
+                return creator
+            # 取得できた1000人のうち、f_0 だけがフォローを返していない。
+            return {"urlname": urlname, "isFollowing": True, "isFollowed": urlname != "f_0"}
+
+        def fake_fetch_v3(_session, _key, kind, _cookie):
+            # 申告総数は正しいが、返ってくるのは1000件だけ。
+            return (followings, 1629) if kind == "followings" else (followers, 1593)
+
+        with patch.object(app_module, "fetch_creator", side_effect=fake_fetch_creator), patch.object(
+            app_module, "fetch_all_follows_v3", side_effect=fake_fetch_v3
+        ):
+            response = self.client.post(
+                "/api/check",
+                json={"username": "me", "cookieHeader": "session=ok"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["capped"])
+        self.assertEqual(data["checkedFollowingCount"], 1000)
+        self.assertEqual(data["checkedFollowerCount"], 1000)
+        # 確認できた範囲の結果は捨てずに出す。ただし範囲を明示する。
+        self.assertEqual([a["urlname"] for a in data["notFollowingBack"]], ["f_0"])
+        self.assertFalse(data["notFollowingBackReliable"])
+        self.assertIn("1,000人", data["notFollowingBackScope"])
+        self.assertIn("1,629人", data["notFollowingBackScope"])
+
     def test_fetch_follow_page_retries_plain_403(self):
         # note.comの前段は一時的に403を返すことがある。以前は403をリトライ対象に
         # 入れていなかったため、1回弾かれただけで「status 403」の素っ気ない

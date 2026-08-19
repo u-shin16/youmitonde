@@ -734,11 +734,26 @@ function renderResult(data) {
   }
 
   if (data.capped) {
-    cappedWarning.textContent = cappedWarningDefaultText;
+    // どこまで確認できたのかを数字で出す。「一部しか確認できていない」だけだと、
+    // 表示されている件数がどの範囲の話なのか分からないため。
+    const checked = [];
+    if (data.checkedFollowingCount < creator.followingCount) {
+      checked.push(
+        `フォロー中 ${data.checkedFollowingCount.toLocaleString()} / ${creator.followingCount.toLocaleString()}`
+      );
+    }
+    if (data.checkedFollowerCount < creator.followerCount) {
+      checked.push(
+        `フォロワー ${data.checkedFollowerCount.toLocaleString()} / ${creator.followerCount.toLocaleString()}`
+      );
+    }
+    cappedWarning.textContent = checked.length
+      ? `⚠️ note.com側の上限により、途中までしか確認できていません（${checked.join("、")}）。下の一覧はこの範囲での結果です。`
+      : cappedWarningDefaultText;
     cappedWarning.hidden = false;
   }
 
-  if (data.notFollowingBackReliable === false) {
+  if (data.notFollowingBackReliable === false && !data.notFollowingBackScope) {
     unfollowPanel.renderUnavailable(
       "フォロワー一覧がnote.com側の上限で一部しか取得できないため、フォローバックされていない人は正確に判定できません。"
     );

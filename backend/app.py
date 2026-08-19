@@ -496,29 +496,46 @@ def check():
     follower_identities = account_identities(followers)
     follower_count = creator.get("followerCount") or 0
     following_count = creator.get("followingCount") or 0
-    followers_capped = follower_count > 0 and follower_count > followers_total
-    followings_capped = following_count > 0 and following_count > followings_total
+    # 上限判定は2種類ある。どちらか一方でも当てはまれば「全部は見られていない」。
+    #   (1) note.comが申告する総数そのものが頭打ちになっている（公開v2の~1000件上限）
+    #   (2) 総数は正しいのに、一覧が途中で打ち切られて取り切れていない
+    # (2)を見ていなかったため、認証済みv3が「総数1629」と正しく返しつつ実際には
+    # 1000件しか返さないケースを「全部取れた」と誤判定し、1000件中の結果を
+    # 1629件中の結果であるかのように表示していた。
+    followers_capped = (follower_count > 0 and follower_count > followers_total) or (
+        followers_total > 0 and len(followers) < followers_total
+    )
+    followings_capped = (following_count > 0 and following_count > followings_total) or (
+        followings_total > 0 and len(followings) < followings_total
+    )
     auth_warning = None
     to_follow_back_unavailable_reason = None
 
-    if followers_capped:
-        not_following_back = []
-    else:
-        not_following_back = [
-            to_account(f) for f in followings if not is_known_account(f, follower_identities)
-        ]
-    not_following_back.sort(key=lambda account: account["name"])
-    not_following_back_reliable = not followers_capped
-    if authenticated_check and not followings_capped:
-        # This method checks each followed account's authenticated isFollowed
-        # state directly, so it doesn't depend on our (possibly capped)
-        # followers list at all.
+    not_following_back_scope = None
+    if authenticated_check:
+        # 各アカウントのisFollowedを直接見る方式。フォロワー一覧の取得状況に
+        # 依存しないため、フォロー中一覧が途中までしか取れていない場合でも、
+        # 取れた範囲については正しい結果になる。範囲だけ利用者に伝える。
         not_following_back = refine_accounts_with_authenticated_state(
             session,
             [to_account(f) for f in followings],
             cookie_header,
             lambda detail: not detail.get("isFollowed"),
         )
+        not_following_back_reliable = not followings_capped
+        if followings_capped:
+            not_following_back_scope = (
+                f"フォロー中{following_count:,}人のうち、note.com側の上限で確認できた"
+                f"{len(followings):,}人の中での結果です。"
+            )
+    elif followers_capped:
+        not_following_back = []
+        not_following_back_reliable = False
+    else:
+        not_following_back = [
+            to_account(f) for f in followings if not is_known_account(f, follower_identities)
+        ]
+        not_following_back.sort(key=lambda account: account["name"])
         not_following_back_reliable = True
 
     if authenticated_check and not followers_capped:
@@ -576,6 +593,7 @@ def check():
             "notFollowingBack": not_following_back,
             "toFollowBack": to_follow_back,
             "notFollowingBackReliable": not_following_back_reliable,
+            "notFollowingBackScope": not_following_back_scope,
             "toFollowBackReliable": authenticated_check and not followers_capped,
             "toFollowBackUnavailableReason": to_follow_back_unavailable_reason,
             "authenticatedCheck": authenticated_check,
