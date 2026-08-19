@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import re
 import time
@@ -12,6 +13,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = os.path.join(BASE_DIR, "..", "frontend")
 EXTENSION_DIR = os.path.join(BASE_DIR, "..", "extension")
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
+
+# gunicorn配下ではFlaskのapp.loggerに出力先が付かず、WARNING未満が捨てられる。
+# gunicornのエラーロガーに相乗りさせて、INFOをjournalへ流す。
+_gunicorn_logger = logging.getLogger("gunicorn.error")
+if _gunicorn_logger.handlers:
+    app.logger.handlers = _gunicorn_logger.handlers
+    app.logger.setLevel(_gunicorn_logger.level or logging.INFO)
+else:
+    logging.basicConfig(level=logging.INFO)
+    app.logger.setLevel(logging.INFO)
 
 NOTE_API_BASE = "https://note.com/api/v2/creators"
 NOTE_FOLLOW_API_BASE = "https://note.com/api/v3/users"
