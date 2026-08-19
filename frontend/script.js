@@ -719,7 +719,6 @@ function renderResult(data) {
       <div class="profile-card__name">${escapeHtml(creator.name || creator.urlname)}</div>
       <div class="profile-card__stats">
         フォロー中 ${creator.followingCount.toLocaleString()} ・ フォロワー ${creator.followerCount.toLocaleString()}
-        （確認済み: フォロー中 ${data.checkedFollowingCount} 件 / フォロワー ${data.checkedFollowerCount} 件）
       </div>
     </div>
   `;
