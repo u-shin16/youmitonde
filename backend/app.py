@@ -530,6 +530,27 @@ def check():
 
     capped = followers_capped or followings_capped
 
+    # 画面の数字（note.comのプロフィールカウンター）と、実際に突き合わせた件数の
+    # ズレを追うための記録。プロフィールの数字と、こちらが取得できた一覧の件数と、
+    # 片思い判定の結果が別ソースになるため、食い違ったときはここを見る。
+    app.logger.info(
+        "check urlname=%s auth=%s プロフィール(following=%s follower=%s) "
+        "取得(following=%s follower=%s) total(following=%s follower=%s) "
+        "capped(following=%s follower=%s) 片思い=%s フォロー返し候補=%s",
+        urlname,
+        authenticated_check,
+        following_count,
+        follower_count,
+        len(followings),
+        len(followers),
+        followings_total,
+        followers_total,
+        followings_capped,
+        followers_capped,
+        len(not_following_back),
+        len(to_follow_back),
+    )
+
     return jsonify(
         {
             "creator": {
