@@ -138,6 +138,69 @@ class CheckEndpointTest(unittest.TestCase):
         self.assertEqual(total, 0)
         self.assertTrue(is_last)
 
+    def test_fetch_follow_page_retries_plain_403(self):
+        # note.comの前段は一時的に403を返すことがある。以前は403をリトライ対象に
+        # 入れていなかったため、1回弾かれただけで「status 403」の素っ気ない
+        # エラーが利用者に出ていた。
+        class PlainForbiddenResponse:
+            def __init__(self, status_code):
+                self.status_code = status_code
+                self.headers = {}
+                self.text = ""
+
+            def json(self):
+                return {"data": {"follows": [], "totalCount": 0, "isLastPage": True}}
+
+        class FlakySession:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, *_args, **_kwargs):
+                self.calls += 1
+                return PlainForbiddenResponse(403 if self.calls == 1 else 200)
+
+        session = FlakySession()
+        with patch.object(app_module.time, "sleep"):
+            follows, total, is_last = app_module.fetch_follow_page(session, "me", "followings", 1)
+
+        self.assertEqual(session.calls, 2)
+        self.assertEqual(follows, [])
+        self.assertTrue(is_last)
+
+    def test_fetch_follow_page_does_not_retry_cloudfront_block(self):
+        # ハードブロック中に投げ直しても通らず、叩き続けるとブロックが延びる。
+        class CloudFrontBlockResponse:
+            status_code = 403
+            headers = {"X-Cache": "Error from cloudfront"}
+            text = "<HTML><HEAD><TITLE>ERROR</TITLE></HEAD></HTML>"
+
+        class BlockedSession:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, *_args, **_kwargs):
+                self.calls += 1
+                return CloudFrontBlockResponse()
+
+        session = BlockedSession()
+        with patch.object(app_module.time, "sleep"):
+            with self.assertRaises(app_module.NoteApiError) as context:
+                app_module.fetch_follow_page(session, "me", "followings", 1)
+
+        self.assertEqual(session.calls, 1)
+        self.assertEqual(context.exception.status, 403)
+        self.assertIn("アクセス制限", context.exception.message)
+
+    def test_cloudfront_block_detected_beyond_first_500_characters(self):
+        # 判定が本文の先頭500文字だけを見ていたため、<head>が長いブロックページを
+        # 取りこぼして「status 403」になっていた。
+        class LongCloudFrontBlockResponse:
+            status_code = 403
+            headers = {}
+            text = "<!-- " + ("x" * 900) + " -->The request could not be satisfied"
+
+        self.assertTrue(app_module.is_cloudfront_block_response(LongCloudFrontBlockResponse()))
+
     def test_fetch_follow_page_handles_non_json_note_response(self):
         class NonJsonResponse:
             status_code = 200
