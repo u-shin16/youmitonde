@@ -33,7 +33,8 @@ MAX_FOLLOW_LIST_ITEMS = 20000  # safety cap against accidental/huge account list
 # note.com's actual per-page size for these endpoints is undocumented and has changed before, so a fixed
 # page-count cap silently turns into a much lower item cap whenever the real page size is smaller than assumed)
 FOLLOW_LIST_PAGE_SIZE_PARAM = 100  # passing &per= at all lifts note.com's ~600-item cap on these lists
-NOTE_V3_USER_LIST_PAGE_SIZE = 20  # observed from note.com's own web UI
+NOTE_V3_USER_LIST_PAGE_SIZE = 100  # 大きめのperをまず試す。理由は fetch_first_page_v3 を参照
+NOTE_V3_USER_LIST_PAGE_SIZE_FALLBACK = 20  # note.com自身のWeb UIが使う値。perが拒否されたときの戻り先
 FOLLOW_ACTION_DELAY_SECONDS = 4.0  # note.com 429s a burst of follow/unfollow calls; space them out
 # (CloudFront in front of note.com has also been observed to hard-block this server's IP entirely
 # after ~20 sequential follow/unfollow calls at the old 2.5s spacing -- see is_cloudfront_block_response)
@@ -267,7 +268,7 @@ def fetch_all_follows(session, urlname, kind):
 # NOTE_FOLLOW_API_BASE family already used for follow/unfollow -- which returns
 # the real, uncapped total. Its response shape uses snake_case fields
 # (total_count / is_last_page), unlike the v2 endpoint's camelCase.
-def fetch_follow_page_v3(session, key, kind, page, cookie_header):
+def fetch_follow_page_v3(session, key, kind, page, cookie_header, per=NOTE_V3_USER_LIST_PAGE_SIZE):
     headers = {
         **REQUEST_HEADERS,
         "X-Requested-With": "XMLHttpRequest",
@@ -276,7 +277,7 @@ def fetch_follow_page_v3(session, key, kind, page, cookie_header):
     resp = request_with_retries(
         session,
         f"{NOTE_FOLLOW_API_BASE}/{key}/{kind}",
-        params={"page": page, "per": NOTE_V3_USER_LIST_PAGE_SIZE},
+        params={"page": page, "per": per},
         headers=headers,
     )
     raise_for_transient_status(resp)
@@ -292,20 +293,61 @@ def fetch_follow_page_v3(session, key, kind, page, cookie_header):
     return data.get("follows", []), data.get("total_count", 0), data.get("is_last_page", True)
 
 
-def fetch_follow_page_v3_resilient(session, key, kind, page, cookie_header):
+def fetch_follow_page_v3_resilient(
+    session, key, kind, page, cookie_header, per=NOTE_V3_USER_LIST_PAGE_SIZE
+):
     last_error = None
     for delay in (0.0, *FOLLOW_PAGE_RETRY_BACKOFF_SECONDS):
         if delay:
             time.sleep(delay)
         try:
-            return fetch_follow_page_v3(session, key, kind, page, cookie_header)
+            return fetch_follow_page_v3(session, key, kind, page, cookie_header, per)
         except NoteApiError as exc:
             last_error = exc
     raise last_error
 
 
+def fetch_first_page_v3(session, key, kind, cookie_header):
+    """1ページ目を大きめのperで試し、通らなければWeb UIと同じperへ戻す。
+
+    v3は総数(total_count)を正しく返すのに、一覧そのものは~1000件で打ち切られる。
+    公開v2では per を渡すこと自体で上限が緩んだ実績があるため、v3にも同じ手を試す。
+    ただしv3がこの値を受け付ける保証はなく、ここで失敗すると一覧が丸ごと取れず
+    フォロー返し判定まで使えなくなる。必ず元のperへ戻せるようにしておく。
+
+    返り値は (実際に使ったper, 1ページ目の結果)。
+    """
+    try:
+        page = fetch_follow_page_v3_resilient(
+            session, key, kind, 1, cookie_header, NOTE_V3_USER_LIST_PAGE_SIZE
+        )
+    except NoteApiError as exc:
+        app.logger.info(
+            "v3の%s取得でper=%sが通らなかったのでper=%sへ戻します（%s）",
+            kind,
+            NOTE_V3_USER_LIST_PAGE_SIZE,
+            NOTE_V3_USER_LIST_PAGE_SIZE_FALLBACK,
+            exc,
+        )
+        return NOTE_V3_USER_LIST_PAGE_SIZE_FALLBACK, fetch_follow_page_v3_resilient(
+            session, key, kind, 1, cookie_header, NOTE_V3_USER_LIST_PAGE_SIZE_FALLBACK
+        )
+
+    follows, total, _ = page
+    # perが黙って無視されて小さいページが返ってきても、以降のページ数は実際の
+    # 件数から決めるので動作は壊れない。効いたかどうかを後から確かめられるよう記録する。
+    app.logger.info(
+        "v3の%s: per=%sを要求して%s件、total_count=%s",
+        kind,
+        NOTE_V3_USER_LIST_PAGE_SIZE,
+        len(follows),
+        total,
+    )
+    return NOTE_V3_USER_LIST_PAGE_SIZE, page
+
+
 def fetch_all_follows_v3(session, key, kind, cookie_header):
-    follows, total, is_last = fetch_follow_page_v3_resilient(session, key, kind, 1, cookie_header)
+    per, (follows, total, is_last) = fetch_first_page_v3(session, key, kind, cookie_header)
     if is_last or not follows:
         return follows, total
 
@@ -315,7 +357,7 @@ def fetch_all_follows_v3(session, key, kind, cookie_header):
 
     def worker(page):
         time.sleep(0.05)
-        return fetch_follow_page_v3_resilient(session, key, kind, page, cookie_header)
+        return fetch_follow_page_v3_resilient(session, key, kind, page, cookie_header, per)
 
     next_page = 2
     wave_end = min(max(-(-total // page_size), next_page), max_pages)
@@ -336,6 +378,16 @@ def fetch_all_follows_v3(session, key, kind, cookie_header):
     all_follows = []
     for page in sorted(results):
         all_follows.extend(results[page])
+    # note.comが申告する総数に届いたかどうかで、上限に当たったかが分かる。
+    # perを上げた効果を後から確かめるために残す。
+    app.logger.info(
+        "v3の%s: per=%sで%s件取得（total_count=%s、%s）",
+        kind,
+        per,
+        len(all_follows),
+        total,
+        "全件" if total and len(all_follows) >= total else "途中で打ち切られた",
+    )
     return all_follows, max(total, len(all_follows))
 
 
