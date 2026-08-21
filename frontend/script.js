@@ -381,7 +381,10 @@ function createAccountPanel({
   }
 
   return {
-    render(newAccounts) {
+    // unknownCount: note.com側の制限で判定できず、一覧から外した人数。
+    // 0人だったときに黙って「該当者なし」と出すと、確認できなかっただけの人が
+    // いないことにされてしまうため、必ず件数を添える。
+    render(newAccounts, unknownCount = 0) {
       accounts = newAccounts;
       selectAllEl.checked = false;
       panelStatusEl.hidden = true;
@@ -392,6 +395,10 @@ function createAccountPanel({
 
       if (newAccounts.length === 0) {
         sectionEl.hidden = true;
+        if (unknownCount > 0) {
+          emptyEl.textContent = `${unknownCount.toLocaleString()}人はnote.com側の制限で確認できませんでした。確認できた範囲では該当者はいません。`;
+          emptyEl.classList.add("warning");
+        }
         emptyEl.hidden = false;
         countEl.textContent = "";
         return false;
@@ -399,7 +406,9 @@ function createAccountPanel({
 
       emptyEl.hidden = true;
       sectionEl.hidden = false;
-      countEl.textContent = `（${newAccounts.length}人）`;
+      countEl.textContent = unknownCount > 0
+        ? `（${newAccounts.length}人 ／ ${unknownCount.toLocaleString()}人は確認できませんでした）`
+        : `（${newAccounts.length}人）`;
       listEl.innerHTML = newAccounts
         .map(
           (account) => `
@@ -758,7 +767,7 @@ function renderResult(data) {
       "フォロワー一覧がnote.com側の上限で一部しか取得できないため、フォローバックされていない人は正確に判定できません。"
     );
   } else {
-    unfollowPanel.render(data.notFollowingBack);
+    unfollowPanel.render(data.notFollowingBack, data.notFollowingBackUnknownCount || 0);
   }
 
   if (data.toFollowBackReliable === false) {
@@ -767,7 +776,7 @@ function renderResult(data) {
         "フォロー返し候補を正確に判定できないため、この一覧は表示しません。"
     );
   } else {
-    followPanel.render(data.toFollowBack);
+    followPanel.render(data.toFollowBack, data.toFollowBackUnknownCount || 0);
   }
 }
 

@@ -422,9 +422,24 @@ def cookie_matches_creator(session, urlname, cookie_header):
     return bool(creator and creator.get("isMyself"))
 
 
+# 詳細を引けなかったアカウントを表す印。keep_accountを評価できていないので、
+# 残すことも捨てることもできない。
+_UNKNOWN_ACCOUNT = object()
+
+
 def refine_accounts_with_authenticated_state(session, accounts, cookie_header, keep_account):
+    """各アカウントの詳細を引き、keep_accountがTrueのものだけ残す。
+
+    返り値は (残ったアカウント, 確認できなかった件数)。
+
+    以前は詳細を取得できなかったアカウントをそのまま一覧に残していた。note.comは
+    403/429を返しやすく、その分が「フォローバックされていない人」に混ざっていた。
+    この一覧はフォロー解除の判断に使うため、確認できていない人を混ぜると
+    相互フォローの相手を切ることになる。判定できなかった人は一覧から外し、
+    件数だけ利用者に伝える。
+    """
     if not accounts:
-        return accounts
+        return [], 0
 
     headers = request_headers(cookie_header)
 
@@ -432,7 +447,7 @@ def refine_accounts_with_authenticated_state(session, accounts, cookie_header, k
         try:
             detail = fetch_creator(session, account["urlname"], headers=headers)
         except (NoteApiError, requests.RequestException):
-            return account
+            return _UNKNOWN_ACCOUNT
 
         if detail is None:
             # note.com returned 404 for this account: it's been deleted/withdrawn
@@ -442,15 +457,18 @@ def refine_accounts_with_authenticated_state(session, accounts, cookie_header, k
         return account if keep_account(detail) else None
 
     refined = []
+    unknown = 0
     with ThreadPoolExecutor(max_workers=AUTH_VERIFY_WORKERS) as executor:
         futures = [executor.submit(worker, account) for account in accounts]
         for future in as_completed(futures):
-            account = future.result()
-            if account:
-                refined.append(account)
+            result = future.result()
+            if result is _UNKNOWN_ACCOUNT:
+                unknown += 1
+            elif result:
+                refined.append(result)
 
     refined.sort(key=lambda account: account["name"])
-    return refined
+    return refined, unknown
 
 
 @app.get("/api/creator/<urlname>")
@@ -530,11 +548,14 @@ def check():
     to_follow_back_unavailable_reason = None
 
     not_following_back_scope = None
+    # 詳細を引けず判定できなかった件数。どの分岐を通っても値が入るようにしておく。
+    not_following_back_unknown = 0
+    to_follow_back_unknown = 0
     if authenticated_check:
         # 各アカウントのisFollowedを直接見る方式。フォロワー一覧の取得状況に
         # 依存しないため、フォロー中一覧が途中までしか取れていない場合でも、
         # 取れた範囲については正しい結果になる。範囲だけ利用者に伝える。
-        not_following_back = refine_accounts_with_authenticated_state(
+        not_following_back, not_following_back_unknown = refine_accounts_with_authenticated_state(
             session,
             [to_account(f) for f in followings],
             cookie_header,
@@ -557,7 +578,7 @@ def check():
         not_following_back_reliable = True
 
     if authenticated_check and not followers_capped:
-        to_follow_back = refine_accounts_with_authenticated_state(
+        to_follow_back, to_follow_back_unknown = refine_accounts_with_authenticated_state(
             session,
             [to_account(f) for f in followers],
             cookie_header,
@@ -596,6 +617,14 @@ def check():
         len(not_following_back),
         len(to_follow_back),
     )
+    if not_following_back_unknown or to_follow_back_unknown:
+        # 403/429で判定できなかった分。多いときは一覧が実態より少なく見える。
+        app.logger.info(
+            "check urlname=%s 確認できず除外 片思い=%s フォロー返し候補=%s",
+            urlname,
+            not_following_back_unknown,
+            to_follow_back_unknown,
+        )
 
     return jsonify(
         {
@@ -610,6 +639,8 @@ def check():
             "checkedFollowerCount": len(followers),
             "notFollowingBack": not_following_back,
             "toFollowBack": to_follow_back,
+            "notFollowingBackUnknownCount": not_following_back_unknown,
+            "toFollowBackUnknownCount": to_follow_back_unknown,
             "notFollowingBackReliable": not_following_back_reliable,
             "notFollowingBackScope": not_following_back_scope,
             "toFollowBackReliable": authenticated_check and not followers_capped,

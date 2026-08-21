@@ -1051,6 +1051,57 @@ class FollowActionEndpointTest(unittest.TestCase):
         self.assertIn("Cookieが正しいか確認", results[0]["error"])
 
 
+class UnknownAccountTest(unittest.TestCase):
+    """詳細を引けなかったアカウントの扱い。
+
+    以前は取得に失敗したアカウントをそのまま「フォローバックされていない人」として
+    一覧に残していた。note.comは403/429を返しやすく、確認できなかっただけの人が
+    混ざる。この一覧はフォロー解除の判断に使うため、混ぜると相互フォローの相手を
+    切ることになる。判定できなかった人は一覧から外し、件数だけ返す。
+    """
+
+    def setUp(self):
+        app_module.app.config["TESTING"] = True
+        self.client = app_module.app.test_client()
+
+    def test_unreachable_accounts_are_excluded_and_counted(self):
+        accounts = [{"urlname": f"u{i}", "name": f"u{i}"} for i in range(3)]
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            if urlname == "u1":
+                raise app_module.NoteApiError("403")
+            # u0だけが条件に合う
+            return {"urlname": urlname, "isFollowed": urlname != "u0"}
+
+        with patch.object(app_module, "fetch_creator", side_effect=fake_fetch_creator):
+            refined, unknown = app_module.refine_accounts_with_authenticated_state(
+                None, accounts, "session=ok", lambda detail: not detail.get("isFollowed")
+            )
+
+        self.assertEqual([a["urlname"] for a in refined], ["u0"])
+        self.assertEqual(unknown, 1, "確認できなかった1件が数えられていない")
+        self.assertNotIn("u1", [a["urlname"] for a in refined], "確認できなかった人が一覧に残っている")
+
+    def test_deleted_accounts_are_dropped_without_counting_as_unknown(self):
+        """404は退会・削除済み。判定できなかったのとは違うので数に入れない。"""
+        accounts = [{"urlname": "gone", "name": "gone"}]
+
+        with patch.object(app_module, "fetch_creator", return_value=None):
+            refined, unknown = app_module.refine_accounts_with_authenticated_state(
+                None, accounts, "session=ok", lambda detail: True
+            )
+
+        self.assertEqual(refined, [])
+        self.assertEqual(unknown, 0)
+
+    def test_empty_input(self):
+        refined, unknown = app_module.refine_accounts_with_authenticated_state(
+            None, [], "session=ok", lambda detail: True
+        )
+        self.assertEqual(refined, [])
+        self.assertEqual(unknown, 0)
+
+
 class V3PageSizeTest(unittest.TestCase):
     """v3の一覧取得で使う per の値。
 
