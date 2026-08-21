@@ -1052,60 +1052,23 @@ class FollowActionEndpointTest(unittest.TestCase):
 
 
 class V3PageSizeTest(unittest.TestCase):
-    """v3の一覧取得で per を上げる変更まわり。
+    """v3の一覧取得で使う per の値。
 
-    v3は総数を正しく返すのに一覧は~1000件で打ち切られる。公開v2で効いた
-    「perを渡す」手をv3にも試すが、拒否されたときに一覧ごと取れなくなると
-    フォロー返し判定まで丸ごと使えなくなるため、必ず元のperへ戻す。
+    2026-08-21に per=100 を試したところ、note.comのv3は 200 を返しながら中身を
+    空で返し、フォロー中・フォロワーとも0件になった。エラーではないので
+    「失敗したらperを下げる」形のフォールバックでは拾えない。
+    公開v2では per を渡すと上限が緩むが、v3では通用しないと分かったため、
+    Web UIと同じ20に固定する。ここを増やすと本番が0件になる。
     """
 
-    def test_first_page_uses_large_per(self):
-        calls = []
+    def test_v3_page_size_stays_at_web_ui_value(self):
+        self.assertEqual(app_module.NOTE_V3_USER_LIST_PAGE_SIZE, 20)
 
-        def fake_page(_session, _key, kind, page, _cookie, per=None):
-            calls.append(per)
-            return [{"urlname": f"u{page}"}], 1, True
-
-        with patch.object(app_module, "fetch_follow_page_v3_resilient", side_effect=fake_page):
-            per, _ = app_module.fetch_first_page_v3(None, "key", "followers", "session=ok")
-
-        self.assertEqual(per, app_module.NOTE_V3_USER_LIST_PAGE_SIZE)
-        self.assertEqual(calls, [app_module.NOTE_V3_USER_LIST_PAGE_SIZE])
-
-    def test_falls_back_to_web_ui_page_size_when_large_per_is_rejected(self):
-        calls = []
-
-        def fake_page(_session, _key, kind, page, _cookie, per=None):
-            calls.append(per)
-            if per == app_module.NOTE_V3_USER_LIST_PAGE_SIZE:
-                raise app_module.NoteApiError("perが拒否されました")
-            return [{"urlname": "u1"}], 1, True
-
-        with patch.object(app_module, "fetch_follow_page_v3_resilient", side_effect=fake_page):
-            per, (follows, total, is_last) = app_module.fetch_first_page_v3(
-                None, "key", "followers", "session=ok"
-            )
-
-        self.assertEqual(per, app_module.NOTE_V3_USER_LIST_PAGE_SIZE_FALLBACK)
-        self.assertEqual(
-            calls,
-            [
-                app_module.NOTE_V3_USER_LIST_PAGE_SIZE,
-                app_module.NOTE_V3_USER_LIST_PAGE_SIZE_FALLBACK,
-            ],
-        )
-        self.assertEqual(len(follows), 1)
-        self.assertEqual(total, 1)
-        self.assertTrue(is_last)
-
-    def test_remaining_pages_reuse_the_per_that_worked(self):
-        """1ページ目でperを下げたなら、2ページ目以降も同じperで取りにいく。"""
+    def test_v3_requests_use_the_web_ui_page_size(self):
         seen = []
 
         def fake_page(_session, _key, kind, page, _cookie, per=None):
             seen.append((page, per))
-            if per == app_module.NOTE_V3_USER_LIST_PAGE_SIZE:
-                raise app_module.NoteApiError("perが拒否されました")
             items = [{"urlname": f"u{page}_{i}"} for i in range(20)]
             return items, 40, page >= 2
 
@@ -1114,17 +1077,16 @@ class V3PageSizeTest(unittest.TestCase):
 
         self.assertEqual(len(follows), 40)
         self.assertEqual(total, 40)
-        later = [per for page, per in seen if page >= 2]
-        self.assertTrue(later, "2ページ目以降が取得されていない")
+        self.assertTrue(seen)
         self.assertTrue(
-            all(per == app_module.NOTE_V3_USER_LIST_PAGE_SIZE_FALLBACK for per in later),
-            f"1ページ目で下げたperが以降のページに引き継がれていない: {seen}",
+            all(per == 20 for _page, per in seen),
+            f"v3へ20以外のperを送っている: {seen}",
         )
 
     def test_page_size_follows_the_actual_response_not_the_requested_per(self):
-        """perを要求どおりに返さないときでも、ページ数の計算が壊れないこと。"""
+        """返ってきた件数が要求と違っても、ページ数の計算が壊れないこと。"""
+
         def fake_page(_session, _key, kind, page, _cookie, per=None):
-            # per=100を要求しても20件しか返さない場合。
             items = [{"urlname": f"u{page}_{i}"} for i in range(20)]
             return items, 60, page >= 3
 
