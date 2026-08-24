@@ -1051,6 +1051,78 @@ class FollowActionEndpointTest(unittest.TestCase):
         self.assertIn("Cookieが正しいか確認", results[0]["error"])
 
 
+class ToFollowBackWhenCappedTest(unittest.TestCase):
+    """フォロワー一覧が上限に当たっていても、フォロー返し候補は出す。
+
+    以前はfollowers_cappedのときフォロー返し候補を丸ごと非表示にしていた。
+    そのため、フォロワーが1,000人を超えたアカウントでは候補が一切出なくなっていた。
+    片思い側と同じで、各アカウントのisFollowingを個別に見る方式なので、
+    取れた範囲の結果は正しい。上限は超えられないので、範囲を伝えたうえで出す。
+    """
+
+    def setUp(self):
+        app_module.app.config["TESTING"] = True
+        self.client = app_module.app.test_client()
+
+    def test_candidates_are_shown_with_scope_when_followers_are_capped(self):
+        creator = {
+            "urlname": "me",
+            "nickname": "Me",
+            "key": "mekey",
+            "isMyself": True,  # これが無いと認証済み判定にならずv2経路へ落ちる
+            "followingCount": 1200,
+            "followerCount": 1500,
+        }
+        followings = [{"urlname": "mutual", "nickname": "mutual"}]
+        followers = [
+            {"urlname": "mutual", "nickname": "mutual"},
+            {"urlname": "not_followed_back_yet", "nickname": "yet"},
+        ]
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            if urlname == "me":
+                return creator
+            if urlname == "not_followed_back_yet":
+                # 自分はフォローしていない＝フォロー返し候補
+                return {"urlname": urlname, "isFollowing": False, "isFollowed": True}
+            return {"urlname": urlname, "isFollowing": True, "isFollowed": True}
+
+        def fake_fetch_v3(_session, _key, kind, _cookie):
+            # 申告総数より少ない件数しか返らない＝上限に当たっている
+            return (followings, 1200) if kind == "followings" else (followers, 1500)
+
+        with patch.object(app_module, "fetch_creator", side_effect=fake_fetch_creator), patch.object(
+            app_module, "fetch_all_follows_v3", side_effect=fake_fetch_v3
+        ):
+            response = self.client.post(
+                "/api/check",
+                json={"username": "me", "cookieHeader": "session=ok"},
+            )
+
+        data = response.get_json()
+        self.assertTrue(data["capped"], "上限に当たっている前提のテスト")
+        self.assertTrue(data["toFollowBackReliable"], "認証済みなら候補を出す")
+        self.assertEqual(
+            [a["urlname"] for a in data["toFollowBack"]],
+            ["not_followed_back_yet"],
+            "上限に当たると候補が丸ごと消える回帰",
+        )
+        self.assertIn("確認できた", data["toFollowBackScope"] or "", "範囲が伝わっていない")
+
+    def test_unauthenticated_still_hides_candidates(self):
+        """Cookieなしではフォロー済みか確認できないので、従来どおり出さない。"""
+        creator = {"urlname": "me", "nickname": "Me", "followingCount": 1, "followerCount": 1}
+
+        with patch.object(app_module, "fetch_creator", return_value=creator), patch.object(
+            app_module, "fetch_all_follows", return_value=([], 0)
+        ):
+            response = self.client.post("/api/check", json={"username": "me", "cookieHeader": "x"})
+
+        data = response.get_json()
+        self.assertFalse(data["toFollowBackReliable"])
+        self.assertEqual(data["toFollowBack"], [])
+
+
 class UnknownAccountTest(unittest.TestCase):
     """詳細を引けなかったアカウントの扱い。
 

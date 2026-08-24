@@ -548,6 +548,7 @@ def check():
     to_follow_back_unavailable_reason = None
 
     not_following_back_scope = None
+    to_follow_back_scope = None
     # 詳細を引けず判定できなかった件数。どの分岐を通っても値が入るようにしておく。
     not_following_back_unknown = 0
     to_follow_back_unknown = 0
@@ -577,20 +578,27 @@ def check():
         not_following_back.sort(key=lambda account: account["name"])
         not_following_back_reliable = True
 
-    if authenticated_check and not followers_capped:
+    if authenticated_check:
+        # 片思い側と同じ考え方。各アカウントのisFollowingを直接見る方式なので、
+        # フォロワー一覧が途中までしか取れていなくても、取れた範囲の結果は正しい。
+        # 以前はfollowers_cappedで丸ごと非表示にしていたため、フォロワーが
+        # 1,000人を超えた時点からフォロー返し候補が一切出なくなっていた。
+        # 上限は超えられないので、範囲を伝えたうえで出す。
         to_follow_back, to_follow_back_unknown = refine_accounts_with_authenticated_state(
             session,
             [to_account(f) for f in followers],
             cookie_header,
             lambda detail: not detail.get("isFollowing"),
         )
+        if followers_capped:
+            to_follow_back_scope = (
+                f"フォロワー{follower_count:,}人のうち、note.com側の上限で確認できた"
+                f"{len(followers):,}人の中での結果です。"
+            )
     elif cookie_header and not authenticated_check:
         to_follow_back = []
         auth_warning = "Cookieのログインアカウントとチェック対象が一致しなかったため、フォロー済みかどうかの追加確認は使いませんでした。"
         to_follow_back_unavailable_reason = auth_warning
-    elif followers_capped:
-        to_follow_back = []
-        to_follow_back_unavailable_reason = "フォロワー一覧がnote.com側の上限で一部しか取得できないため、フォロー返し候補は正確に判定できません。"
     else:
         to_follow_back = []
         to_follow_back_unavailable_reason = "フォロー返し候補は、Cookieを貼ってログイン中の本人として確認できた場合だけ表示します。Cookieを入力して再チェックしてください。"
@@ -643,7 +651,8 @@ def check():
             "toFollowBackUnknownCount": to_follow_back_unknown,
             "notFollowingBackReliable": not_following_back_reliable,
             "notFollowingBackScope": not_following_back_scope,
-            "toFollowBackReliable": authenticated_check and not followers_capped,
+            "toFollowBackReliable": authenticated_check,
+            "toFollowBackScope": to_follow_back_scope,
             "toFollowBackUnavailableReason": to_follow_back_unavailable_reason,
             "authenticatedCheck": authenticated_check,
             "authWarning": auth_warning,
