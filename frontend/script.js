@@ -21,6 +21,8 @@ const FOLLOW_ACTION_BATCH_PAUSE_SECONDS = 15; // バッチ間の間隔（レー�
 // バッチ間はより長めに空けている）
 const FOLLOW_ACTION_RATE_LIMIT_COOLDOWN_SECONDS = 90; // レート制限検知後、再試行までのクールダウン
 const FOLLOW_ACTION_MAX_RETRY_ROUNDS = 2; // レート制限からの自動再試行の最大回数
+const EXTENSION_PAGE_SOURCE = "youmitonde-page";
+const EXTENSION_SOURCE = "youmitonde-extension";
 let isChecking = false;
 let checkCooldownUntil = 0;
 let checkCooldownTimer = null;
@@ -29,6 +31,57 @@ let toastTimer = null;
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// 拡張機能が入っていれば、フォロー操作はサーバーではなく利用者のChromeから送る。
+// サーバー（1つのIP）から送るとnote.com前段のCloudFrontに数件でブロックされ、
+// 100件選んでも数件で止まっていた。拡張機能があれば件数の壁がなくなる。
+const extensionBridge = (() => {
+  const handlers = new Map(); // requestId -> 進捗の受け取り口
+  let version = null;
+  let nextId = 1;
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const data = event.data;
+    if (!data || data.source !== EXTENSION_SOURCE) return;
+    if (data.type === "ready") {
+      version = data.version;
+      return;
+    }
+    const handler = handlers.get(data.requestId);
+    if (handler) handler(data);
+  });
+
+  // bridge.jsはdocument_startで自分から名乗るが、拡張機能を後から入れた場合や
+  // 読み込み順が前後した場合に取りこぼすため、こちらからも一度呼びかける。
+  window.postMessage({ source: EXTENSION_PAGE_SOURCE, type: "ping" }, window.location.origin);
+
+  return {
+    get available() {
+      return version !== null;
+    },
+    run(action, targets, onProgress) {
+      return new Promise((resolve, reject) => {
+        const requestId = `youmitonde-${nextId++}`;
+        const results = [];
+        handlers.set(requestId, (message) => {
+          if (message.type === "progress") {
+            results.push(message.result);
+            onProgress(message.result, results.length);
+            return;
+          }
+          handlers.delete(requestId);
+          if (message.type === "done") resolve(results);
+          else reject(new Error(message.error || "拡張機能での処理に失敗しました"));
+        });
+        window.postMessage(
+          { source: EXTENSION_PAGE_SOURCE, type: "action", requestId, action, targets },
+          window.location.origin
+        );
+      });
+    },
+  };
+})();
 
 cookieHelpToggle.addEventListener("click", () => {
   cookieHelpBody.hidden = !cookieHelpBody.hidden;
@@ -135,24 +188,29 @@ async function openAccountModal(account, endpoint, actionVerb, onResolved) {
     beginAction(actionType);
 
     try {
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cookieHeader: cookieInput.value.trim(),
-          targets: [{ key: account.key, urlname: account.urlname }],
-        }),
-      });
-      const data = await res.json();
+      const target = { key: account.key, urlname: account.urlname };
+      let result;
 
-      if (!res.ok) {
-        actionStatus.className = "modal-status error";
-        actionStatus.textContent = data.error || `${actionVerb}に失敗しました`;
-        actionButton.disabled = false;
-        return;
+      if (extensionBridge.available) {
+        const results = await extensionBridge.run(actionType, [target], () => {});
+        result = results[0] || { urlname: account.urlname, success: false, error: "結果を受け取れませんでした" };
+      } else {
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cookieHeader: cookieInput.value.trim(), targets: [target] }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          actionStatus.className = "modal-status error";
+          actionStatus.textContent = data.error || `${actionVerb}に失敗しました`;
+          actionButton.disabled = false;
+          return;
+        }
+        result = data.results[0];
       }
 
-      const result = data.results[0];
       if (onResolved) onResolved([result]);
 
       if (result.success) {
@@ -167,7 +225,7 @@ async function openAccountModal(account, endpoint, actionVerb, onResolved) {
       }
     } catch (err) {
       actionStatus.className = "modal-status error";
-      actionStatus.textContent = "通信に失敗しました";
+      actionStatus.textContent = err.message || "通信に失敗しました";
       actionButton.disabled = false;
     } finally {
       endAction();
@@ -269,9 +327,11 @@ function createAccountPanel({
     });
     if (targets.length === 0) return;
 
-    const confirmed = await showConfirm(
-      `${targets.length}件を${actionVerb}します。よろしいですか？\n（note.com非公式の仕組みを使っているため、失敗する場合もあります。件数が多い時は自動的に段階的に処理します）`
-    );
+    const notice = extensionBridge.available
+      ? "（拡張機能から直接note.comへ送ります。1件ずつ間隔を空けるため、件数ぶんの時間がかかります）"
+      : "（note.com非公式の仕組みを使っているため、失敗する場合もあります。" +
+        "拡張機能が入っていないとサーバー経由になり、note.com側の制限で20件ほどで止まります）";
+    const confirmed = await showConfirm(`${targets.length}件を${actionVerb}します。よろしいですか？\n${notice}`);
     if (!confirmed) return;
 
     buttonEl.disabled = true;
@@ -281,17 +341,29 @@ function createAccountPanel({
     beginAction(actionType);
 
     try {
-      const { successCount, totalCount } = await runFollowActionInBatches(targets);
+      const { successCount, totalCount } = extensionBridge.available
+        ? await runFollowActionViaExtension(targets)
+        : await runFollowActionInBatches(targets);
       if (successCount > 0) startCheckCooldown();
       panelStatusEl.className = "status";
       panelStatusEl.textContent = `${successCount}/${totalCount}件の${actionVerb}に成功しました。再チェックは少し待ってからできます`;
     } catch (err) {
       panelStatusEl.className = "status error";
-      panelStatusEl.textContent = "通信に失敗しました。時間をおいてもう一度お試しください";
+      panelStatusEl.textContent = err.message || "通信に失敗しました。時間をおいてもう一度お試しください";
     } finally {
       endAction();
     }
   });
+
+  // 拡張機能経由。1件ずつ結果が返ってくるので、届いた順に画面へ反映する。
+  async function runFollowActionViaExtension(targets) {
+    panelStatusEl.textContent = `処理中…（0/${targets.length}件完了）`;
+    const results = await extensionBridge.run(actionType, targets, (result, doneCount) => {
+      applyResults([result]);
+      panelStatusEl.textContent = `処理中…（${doneCount}/${targets.length}件完了）`;
+    });
+    return { successCount: results.filter((r) => r.success).length, totalCount: targets.length };
+  }
 
   // 一気に全件送るとnote.comのレート制限に引っかかりやすく、大量選択時は
   // 途中から一律失敗になりがちだった。少数ずつ間隔を空けて送り、レート制限に
