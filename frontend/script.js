@@ -456,7 +456,10 @@ function createAccountPanel({
     // unknownCount: note.com側の制限で判定できず、一覧から外した人数。
     // 0人だったときに黙って「該当者なし」と出すと、確認できなかっただけの人が
     // いないことにされてしまうため、必ず件数を添える。
-    render(newAccounts, unknownCount = 0) {
+    // scopeNote: note.com側の上限で一部しか見られていないときの範囲説明。
+    // 0人だったときに「全員フォローバックしてくれています！」と断言すると、
+    // 見えていない人まで問題なしと言い切ることになるため、範囲を必ず添える。
+    render(newAccounts, unknownCount = 0, scopeNote = null) {
       accounts = newAccounts;
       selectAllEl.checked = false;
       panelStatusEl.hidden = true;
@@ -467,8 +470,13 @@ function createAccountPanel({
 
       if (newAccounts.length === 0) {
         sectionEl.hidden = true;
+        const notes = [];
+        if (scopeNote) notes.push(`${scopeNote}この範囲には該当者はいませんでした。`);
         if (unknownCount > 0) {
-          emptyEl.textContent = `${unknownCount.toLocaleString()}人はnote.com側の制限で確認できませんでした。確認できた範囲では該当者はいません。`;
+          notes.push(`${unknownCount.toLocaleString()}人はnote.com側の制限で確認できませんでした。`);
+        }
+        if (notes.length > 0) {
+          emptyEl.textContent = notes.join("");
           emptyEl.classList.add("warning");
         }
         emptyEl.hidden = false;
@@ -829,7 +837,8 @@ function renderResult(data) {
       );
     }
     cappedWarning.textContent = checked.length
-      ? `⚠️ note.com側の上限により、途中までしか確認できていません（${checked.join("、")}）。下の一覧はこの範囲での結果です。`
+      ? `⚠️ note.com側の上限により、途中までしか確認できていません（${checked.join("、")}）。下の一覧はこの範囲での結果です。` +
+        "note.comが一覧を1,000人ぶんまでしか返さないためで、これはnote.comの仕様です（note.comのサイト上でも1,000人より先はたどれません）。"
       : cappedWarningDefaultText;
     cappedWarning.hidden = false;
   }
@@ -839,7 +848,11 @@ function renderResult(data) {
       "フォロワー一覧がnote.com側の上限で一部しか取得できないため、フォローバックされていない人は正確に判定できません。"
     );
   } else {
-    unfollowPanel.render(data.notFollowingBack, data.notFollowingBackUnknownCount || 0);
+    unfollowPanel.render(
+      data.notFollowingBack,
+      data.notFollowingBackUnknownCount || 0,
+      data.notFollowingBackScope || null
+    );
   }
 
   if (data.toFollowBackReliable === false) {
@@ -848,7 +861,11 @@ function renderResult(data) {
         "フォロー返し候補を正確に判定できないため、この一覧は表示しません。"
     );
   } else {
-    followPanel.render(data.toFollowBack, data.toFollowBackUnknownCount || 0);
+    followPanel.render(
+      data.toFollowBack,
+      data.toFollowBackUnknownCount || 0,
+      data.toFollowBackScope || null
+    );
   }
 }
 
