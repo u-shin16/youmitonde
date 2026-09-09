@@ -1220,5 +1220,99 @@ class V3PageSizeTest(unittest.TestCase):
         self.assertEqual(total, 60)
 
 
+class PrescreenWithListFlagsTest(unittest.TestCase):
+    """一覧に入っている関係フラグで、個別の問い合わせを減らす。
+
+    フォロー中2,445人＋フォロワー2,424人のアカウントでは、1人ずつ確認すると
+    約4,900回になる。note.comの前段CloudFrontはIP単位で数を見ているため、
+    ここで枠を使い切ると後続が弾かれ「確認できませんでした」が大量に出ていた。
+    一覧の項目自体に本人から見た関係が入っているので、それで候補を絞る。
+    ただし読み違えると相互フォローの相手を切ることになるため、
+    抜き取り確認で食い違ったら絞り込みをやめる。
+    """
+
+    def setUp(self):
+        app_module.app.config["TESTING"] = True
+
+    @staticmethod
+    def _entries(mutual_count, oneway_count):
+        entries = [
+            {"urlname": f"m{i}", "name": f"m{i}", "is_followed": True} for i in range(mutual_count)
+        ]
+        entries += [
+            {"urlname": f"o{i}", "name": f"o{i}", "is_followed": False} for i in range(oneway_count)
+        ]
+        return entries
+
+    def test_mutual_accounts_are_not_asked_about_one_by_one(self):
+        entries = self._entries(90, 10)
+        asked = []
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            asked.append(urlname)
+            return {"urlname": urlname, "isFollowed": urlname.startswith("m")}
+
+        with patch.object(app_module, "fetch_creator", side_effect=fake_fetch_creator):
+            refined, unknown = app_module.refine_accounts_with_authenticated_state(
+                None,
+                entries,
+                "session=ok",
+                lambda detail: not detail.get("isFollowed"),
+                flag_names=("is_followed", "isFollowed"),
+            )
+
+        self.assertEqual([a["urlname"] for a in refined], [f"o{i}" for i in range(10)])
+        self.assertEqual(unknown, 0)
+        self.assertEqual(
+            len(asked),
+            10 + app_module.PRESCREEN_SAMPLE_SIZE,
+            f"候補10人＋抜き取り20人だけのはずが{len(asked)}回問い合わせている",
+        )
+
+    def test_falls_back_to_asking_everyone_when_the_sample_disagrees(self):
+        """一覧が「相互」と言っている人が実は片思いだったら、絞り込みをやめる。"""
+        entries = self._entries(40, 0)
+        asked = []
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            asked.append(urlname)
+            return {"urlname": urlname, "isFollowed": False}
+
+        with patch.object(app_module, "fetch_creator", side_effect=fake_fetch_creator):
+            refined, unknown = app_module.refine_accounts_with_authenticated_state(
+                None,
+                entries,
+                "session=ok",
+                lambda detail: not detail.get("isFollowed"),
+                flag_names=("is_followed", "isFollowed"),
+            )
+
+        self.assertEqual(len(refined), 40, "食い違ったのに絞り込みを続けている")
+        self.assertEqual(unknown, 0)
+        self.assertGreaterEqual(len(asked), 40)
+
+    def test_entries_without_flags_are_all_verified(self):
+        """認証なしの一覧などフラグが無い場合は、今までどおり全員に問い合わせる。"""
+        entries = [{"urlname": f"u{i}", "name": f"u{i}"} for i in range(5)]
+        asked = []
+
+        def fake_fetch_creator(_session, urlname, headers=None):
+            asked.append(urlname)
+            return {"urlname": urlname, "isFollowed": True}
+
+        with patch.object(app_module, "fetch_creator", side_effect=fake_fetch_creator):
+            refined, unknown = app_module.refine_accounts_with_authenticated_state(
+                None,
+                entries,
+                "session=ok",
+                lambda detail: not detail.get("isFollowed"),
+                flag_names=("is_followed", "isFollowed"),
+            )
+
+        self.assertEqual(refined, [])
+        self.assertEqual(unknown, 0)
+        self.assertEqual(sorted(asked), [f"u{i}" for i in range(5)])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -48,6 +48,7 @@ CLOUDFRONT_BLOCK_MARKERS = (
 )
 MAX_FOLLOW_ACTION_TARGETS = 200  # guard against accidental/huge batch requests
 AUTH_VERIFY_WORKERS = 4
+PRESCREEN_SAMPLE_SIZE = 20  # 一覧の関係フラグを信じてよいか確かめるための抜き取り数
 RATE_LIMIT_RETRY_DELAYS_SECONDS = (1.0, 2.0)
 RATE_LIMIT_RETRY_AFTER_SECONDS = 90
 RATE_LIMIT_ERROR_MESSAGE = (
@@ -427,48 +428,104 @@ def cookie_matches_creator(session, urlname, cookie_header):
 _UNKNOWN_ACCOUNT = object()
 
 
-def refine_accounts_with_authenticated_state(session, accounts, cookie_header, keep_account):
-    """各アカウントの詳細を引き、keep_accountがTrueのものだけ残す。
+def entry_relation_flag(entry, flag_names):
+    """一覧の項目に入っている関係フラグ（相互かどうか）を読む。
 
-    返り値は (残ったアカウント, 確認できなかった件数)。
-
-    以前は詳細を取得できなかったアカウントをそのまま一覧に残していた。note.comは
-    403/429を返しやすく、その分が「フォローバックされていない人」に混ざっていた。
-    この一覧はフォロー解除の判断に使うため、確認できていない人を混ぜると
-    相互フォローの相手を切ることになる。判定できなかった人は一覧から外し、
-    件数だけ利用者に伝える。
+    値が入っていなければNone。認証なしで取得した一覧では全員Falseになるため、
+    ここが使えるのはログイン済みの取得だけ。
     """
-    if not accounts:
+    for name in flag_names:
+        value = entry.get(name)
+        if isinstance(value, bool):
+            return value
+    return None
+
+
+def refine_accounts_with_authenticated_state(
+    session, entries, cookie_header, keep_account, flag_names=()
+):
+    """keep_accountがTrueのアカウントだけ残す。返り値は (残った件数, 確認できなかった件数)。
+
+    詳細は1人ずつ問い合わせる必要があり、フォロー中2,445人＋フォロワー2,424人の
+    アカウントでは約4,900回になる。note.comの前段CloudFrontはIP単位で数を見ており、
+    ここで枠を使い切ると後続が弾かれて「確認できませんでした」が大量に出ていた。
+
+    ところが一覧の項目自体に、ログイン中の本人から見た関係（相手が自分を
+    フォローしているか／自分が相手をフォローしているか）が入っている。
+    note.com自身の一覧ページも、この値で「フォローされています」を出している。
+    そこで一覧の値で候補を絞り、候補になった人だけ個別に確認する。
+    問い合わせ回数が数十回まで減り、確認できない人がほとんど出なくなる。
+
+    一覧の値をそのまま信じると、値の意味を読み違えていた場合に相互フォローの
+    相手を切ることになる。そこで「一覧では相互」とされた人からいくらか抜き取って
+    確認し、1人でも食い違ったら絞り込みをやめて全員を個別に確認する。
+    """
+    if not entries:
         return [], 0
 
     headers = request_headers(cookie_header)
 
-    def worker(account):
-        try:
-            detail = fetch_creator(session, account["urlname"], headers=headers)
-        except (NoteApiError, requests.RequestException):
-            return _UNKNOWN_ACCOUNT
+    def verify(targets):
+        # 個別に確認する。確認できなかった人は一覧から外し、件数だけ返す。
+        # note.comは403/429を返しやすく、確認できていない人を混ぜると
+        # 相互フォローの相手を切ることになるため。
+        def worker(entry):
+            try:
+                detail = fetch_creator(session, entry.get("urlname"), headers=headers)
+            except (NoteApiError, requests.RequestException):
+                return _UNKNOWN_ACCOUNT
 
-        if detail is None:
-            # note.com returned 404 for this account: it's been deleted/withdrawn
-            # or otherwise no longer exists, so drop it instead of showing it.
-            return None
+            if detail is None:
+                # 404。退会・削除済みなので、判定できなかったのとは区別して落とす。
+                return None
 
-        return account if keep_account(detail) else None
+            return to_account(entry) if keep_account(detail) else None
 
-    refined = []
-    unknown = 0
-    with ThreadPoolExecutor(max_workers=AUTH_VERIFY_WORKERS) as executor:
-        futures = [executor.submit(worker, account) for account in accounts]
-        for future in as_completed(futures):
-            result = future.result()
-            if result is _UNKNOWN_ACCOUNT:
-                unknown += 1
-            elif result:
-                refined.append(result)
+        kept = []
+        unknown = 0
+        with ThreadPoolExecutor(max_workers=AUTH_VERIFY_WORKERS) as executor:
+            futures = [executor.submit(worker, entry) for entry in targets]
+            for future in as_completed(futures):
+                result = future.result()
+                if result is _UNKNOWN_ACCOUNT:
+                    unknown += 1
+                elif result:
+                    kept.append(result)
+        return kept, unknown
 
+    candidates = []
+    assumed_mutual = []
+    for entry in entries:
+        flag = entry_relation_flag(entry, flag_names)
+        if flag is True:
+            assumed_mutual.append(entry)
+        else:
+            # Falseは候補。Noneは一覧に情報がないので、絞り込まず個別に確認する。
+            candidates.append(entry)
+
+    if assumed_mutual and not prescreen_agrees(assumed_mutual, verify):
+        app.logger.info("一覧の関係フラグが食い違ったため、全員を個別に確認する")
+        candidates = list(entries)
+        assumed_mutual = []
+
+    app.logger.info(
+        "個別確認: %s人中%s人に絞り込み（一覧で相互とみなした%s人は問い合わせない）",
+        len(entries),
+        len(candidates),
+        len(assumed_mutual),
+    )
+
+    refined, unknown = verify(candidates)
     refined.sort(key=lambda account: account["name"])
     return refined, unknown
+
+
+def prescreen_agrees(assumed_mutual, verify):
+    """「一覧では相互」とされた人を抜き取って確認し、食い違いがないか見る。"""
+    step = max(1, len(assumed_mutual) // PRESCREEN_SAMPLE_SIZE)
+    sample = assumed_mutual[::step][:PRESCREEN_SAMPLE_SIZE]
+    kept, _unknown = verify(sample)
+    return not kept
 
 
 @app.get("/api/creator/<urlname>")
@@ -558,9 +615,10 @@ def check():
         # 取れた範囲については正しい結果になる。範囲だけ利用者に伝える。
         not_following_back, not_following_back_unknown = refine_accounts_with_authenticated_state(
             session,
-            [to_account(f) for f in followings],
+            followings,
             cookie_header,
             lambda detail: not detail.get("isFollowed"),
+            flag_names=("is_followed", "isFollowed"),
         )
         not_following_back_reliable = not followings_capped
         if followings_capped:
@@ -586,9 +644,10 @@ def check():
         # 上限は超えられないので、範囲を伝えたうえで出す。
         to_follow_back, to_follow_back_unknown = refine_accounts_with_authenticated_state(
             session,
-            [to_account(f) for f in followers],
+            followers,
             cookie_header,
             lambda detail: not detail.get("isFollowing"),
+            flag_names=("is_following", "isFollowing"),
         )
         if followers_capped:
             to_follow_back_scope = (
