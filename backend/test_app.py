@@ -1314,5 +1314,70 @@ class PrescreenWithListFlagsTest(unittest.TestCase):
         self.assertEqual(sorted(asked), [f"u{i}" for i in range(5)])
 
 
+class DeepCandidatesTest(unittest.TestCase):
+    """1,000人の壁の先にいる人の候補集め。
+
+    フォロー一覧のAPIは20人×50ページ＝1,000人で打ち止めで、読み出し位置を
+    指定する手段も無い。一方スキの一覧にはこの上限が無いので、スキのやりとりが
+    あった人なら1,000人より奥にいても拾える。ここで返すのは候補までで、
+    実際の関係は拡張機能側で1人ずつ確認する。
+    """
+
+    def setUp(self):
+        app_module.app.config["TESTING"] = True
+        self.client = app_module.app.test_client()
+
+    @staticmethod
+    def _user(urlname):
+        return {"urlname": urlname, "key": f"k_{urlname}", "nickname": urlname}
+
+    def _run(self, visible):
+        def fake_contents(_session, urlname, kind, page):
+            if page > 1:
+                return [], True
+            if kind == "note":
+                return [{"key": "note1", "likeCount": 3}], True
+            return [{"user": self._user("liked_author")}], True
+
+        def fake_likes(_session, _note_key, page):
+            if page > 1:
+                return []
+            return [
+                {"user": self._user("hidden_one")},
+                {"user": self._user("already_visible")},
+                {"user": self._user("me")},
+            ]
+
+        def fake_follows(_session, _key, kind, _cookie):
+            return ([{"urlname": name} for name in visible], len(visible))
+
+        with patch.object(app_module, "fetch_creator", return_value={"key": "mykey"}), patch.object(
+            app_module, "fetch_creator_contents", side_effect=fake_contents
+        ), patch.object(app_module, "fetch_note_likes", side_effect=fake_likes), patch.object(
+            app_module, "fetch_all_follows_v3", side_effect=fake_follows
+        ):
+            response = self.client.post("/api/deep-candidates", json={"username": "me"})
+
+        self.assertEqual(response.status_code, 200)
+        return response.get_json()
+
+    def test_accounts_already_in_the_visible_list_are_dropped(self):
+        data = self._run(visible=["already_visible"])
+        names = [c["urlname"] for c in data["candidates"]]
+
+        self.assertIn("hidden_one", names, "壁の先にいる人が候補から漏れている")
+        self.assertIn("liked_author", names, "自分がスキした記事の著者が候補に入っていない")
+        self.assertNotIn("already_visible", names, "すでに一覧に出ている人が候補に混ざっている")
+        self.assertEqual(data["alreadyVisibleCount"], 1)
+
+    def test_the_owner_is_never_a_candidate(self):
+        data = self._run(visible=[])
+        self.assertNotIn("me", [c["urlname"] for c in data["candidates"]])
+
+    def test_username_is_required(self):
+        response = self.client.post("/api/deep-candidates", json={})
+        self.assertEqual(response.status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

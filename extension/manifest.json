@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "よう見とんで ヘルパー",
-  "version": "1.1",
-  "description": "note.comのCookieコピーと、フォロー/フォロー解除の実行を担う「よう見とんで」用の補助拡張機能",
+  "version": "1.2",
+  "description": "note.comのCookieコピー、フォロー/フォロー解除、関係の照合を担う「よう見とんで」用の補助拡張機能",
   "permissions": ["cookies", "scripting"],
   "host_permissions": ["https://note.com/*"],
   "background": {

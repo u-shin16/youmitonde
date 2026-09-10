@@ -26,6 +26,7 @@ else:
 
 NOTE_API_BASE = "https://note.com/api/v2/creators"
 NOTE_FOLLOW_API_BASE = "https://note.com/api/v3/users"
+NOTE_NOTE_API_BASE = "https://note.com/api/v3/notes"
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; YouMitonde/1.0)"}
 REQUEST_TIMEOUT = 10
 MAX_WORKERS = 3  # note.comの前段CloudFrontは同時接続が多いほど403を返しやすい。速度より通ることを優先する
@@ -49,6 +50,12 @@ CLOUDFRONT_BLOCK_MARKERS = (
 MAX_FOLLOW_ACTION_TARGETS = 200  # guard against accidental/huge batch requests
 AUTH_VERIFY_WORKERS = 4
 PRESCREEN_SAMPLE_SIZE = 20  # 一覧の関係フラグを信じてよいか確かめるための抜き取り数
+# スキの履歴から候補を集めるときの上限。記事数・スキ数が多いアカウントで
+# note.comを延々叩き続けないための歯止め。
+DEEP_SEARCH_MAX_NOTE_PAGES = 100
+DEEP_SEARCH_MAX_LIKED_PAGES = 200
+DEEP_SEARCH_MAX_LIKE_PAGES_PER_NOTE = 60
+DEEP_SEARCH_MAX_CANDIDATES = 5000
 RATE_LIMIT_RETRY_DELAYS_SECONDS = (1.0, 2.0)
 RATE_LIMIT_RETRY_AFTER_SECONDS = 90
 RATE_LIMIT_ERROR_MESSAGE = (
@@ -716,6 +723,157 @@ def check():
             "authenticatedCheck": authenticated_check,
             "authWarning": auth_warning,
             "capped": capped,
+        }
+    )
+
+
+def fetch_creator_contents(session, urlname, kind, page):
+    resp = request_with_retries(
+        session, f"{NOTE_API_BASE}/{urlname}/contents", params={"kind": kind, "page": page}
+    )
+    raise_for_transient_status(resp)
+    if resp.status_code != 200:
+        raise NoteApiError(f"記事一覧の取得に失敗しました（status {resp.status_code}）")
+    data = note_json(resp, "contents").get("data")
+    if not isinstance(data, dict):
+        return [], True
+    return data.get("contents", []), bool(data.get("isLastPage"))
+
+
+def fetch_note_likes(session, note_key, page):
+    resp = request_with_retries(
+        session, f"{NOTE_NOTE_API_BASE}/{note_key}/likes", params={"page": page}
+    )
+    raise_for_transient_status(resp)
+    if resp.status_code != 200:
+        raise NoteApiError(f"スキ一覧の取得に失敗しました（status {resp.status_code}）")
+    data = note_json(resp, "likes").get("data")
+    if not isinstance(data, dict):
+        return []
+    return data.get("likes", [])
+
+
+def collect_contents(session, urlname, kind, max_pages):
+    contents = []
+    for page in range(1, max_pages + 1):
+        items, is_last = fetch_creator_contents(session, urlname, kind, page)
+        if not items:
+            break
+        contents.extend(items)
+        if is_last:
+            break
+    return contents
+
+
+def collect_note_likers(session, note_key):
+    likers = []
+    for page in range(1, DEEP_SEARCH_MAX_LIKE_PAGES_PER_NOTE + 1):
+        likes = fetch_note_likes(session, note_key, page)
+        if not likes:
+            break
+        likers.extend(like.get("user") or {} for like in likes)
+        # note.comは1ページ50件で返す。それを下回ったら最後のページ。
+        if len(likes) < 50:
+            break
+    return likers
+
+
+def collect_interaction_candidates(session, urlname):
+    """スキのやりとりからnote IDの候補を集める。
+
+    フォロー一覧のAPIは20人×50ページ＝1,000人で打ち止めで、読み出し位置を
+    指定する手段も無いため、1,001人目から先は取得できない（note.com自身の
+    一覧ページも同じ作りで、同じところで止まる）。
+
+    ところがスキの一覧（/v3/notes/{key}/likes）にはこの上限が無く、51ページ目
+    以降も返ってくる。スキのやりとりがあった人に限られるものの、1,000人より
+    奥にいる人をここから拾える。拾った人が実際にどういう関係かは、1人ずつ
+    確認しないと分からないので、ここで返すのはあくまで候補。
+    """
+    candidates = {}
+
+    def remember(user):
+        name = user.get("urlname")
+        if not name or name == urlname or name in candidates:
+            return
+        candidates[name] = {
+            "key": user.get("key"),
+            "urlname": name,
+            "name": user.get("nickname") or user.get("name") or name,
+            "profileImage": user.get("userProfileImagePath") or user.get("user_profile_image_path"),
+            "noteUrl": f"https://note.com/{name}",
+        }
+
+    # 自分がスキした記事の著者
+    for content in collect_contents(session, urlname, "likes", DEEP_SEARCH_MAX_LIKED_PAGES):
+        remember(content.get("user") or {})
+
+    # 自分の記事にスキしてくれた人
+    notes = collect_contents(session, urlname, "note", DEEP_SEARCH_MAX_NOTE_PAGES)
+    note_keys = [n.get("key") for n in notes if n.get("key") and (n.get("likeCount") or 0) > 0]
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(collect_note_likers, session, key) for key in note_keys]
+        for future in as_completed(futures):
+            for user in future.result():
+                remember(user)
+
+    return candidates, len(notes)
+
+
+@app.post("/api/deep-candidates")
+def deep_candidates():
+    """1,000人の壁の先にいる人の「候補」を返す。
+
+    関係の判定はここではやらない。1人ずつnote.comへ問い合わせる必要があり、
+    サーバーの1つのIPからまとめて投げるとnote.com前段のCloudFrontに
+    ブロックされるため、拡張機能（利用者自身のChrome）側で行う。
+    """
+    payload = request.get_json(silent=True) or {}
+    urlname = normalize_username(payload.get("username", ""))
+    cookie_header = (payload.get("cookieHeader") or "").strip()
+    if not urlname:
+        return jsonify({"error": "noteのユーザー名を入力してください"}), 400
+
+    session = requests.Session()
+    try:
+        creator = fetch_creator(session, urlname, headers=request_headers(cookie_header))
+        if creator is None:
+            return jsonify({"error": "アカウントが見つかりませんでした"}), 404
+
+        candidates, note_count = collect_interaction_candidates(session, urlname)
+
+        # すでに一覧に出ている人は候補から外す。壁の先にいる人だけ残す。
+        creator_key = creator.get("key")
+        visible = set()
+        for kind in ("followings", "followers"):
+            follows, _total = fetch_all_follows_v3(session, creator_key, kind, cookie_header)
+            visible.update(normalized_urlname(f) for f in follows)
+    except NoteApiError as exc:
+        return note_error_response(exc)
+    except requests.RequestException:
+        return jsonify({"error": "note.comへの接続に失敗しました。時間をおいてもう一度お試しください"}), 502
+
+    hidden = [
+        account
+        for name, account in candidates.items()
+        if str(name).strip().lower() not in visible
+    ]
+    hidden.sort(key=lambda account: account["name"])
+
+    app.logger.info(
+        "壁の先の候補: 記事%s本から候補%s人、うち一覧に出ていない%s人",
+        note_count,
+        len(candidates),
+        len(hidden),
+    )
+
+    return jsonify(
+        {
+            "candidates": hidden[:DEEP_SEARCH_MAX_CANDIDATES],
+            "scannedNoteCount": note_count,
+            "collectedCount": len(candidates),
+            "alreadyVisibleCount": len(candidates) - len(hidden),
         }
     )
 

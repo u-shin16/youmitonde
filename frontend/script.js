@@ -11,6 +11,9 @@ const cookieInput = document.getElementById("cookie-input");
 const cookieHelpToggle = document.getElementById("cookie-help-toggle");
 const cookieHelpBody = document.getElementById("cookie-help-body");
 const extensionsUrlCopy = document.getElementById("extensions-url-copy");
+const deepSearchPanel = document.getElementById("deep-search");
+const deepSearchButton = document.getElementById("deep-search-button");
+const deepSearchStatus = document.getElementById("deep-search-status");
 const toastEl = document.getElementById("toast");
 const REQUIRED_COOKIE_MESSAGE = "アカウントチェックにはnote.comのCookie文字列が必要です";
 const CHECK_COOLDOWN_AFTER_ACTION_SECONDS = 90;
@@ -282,6 +285,26 @@ function createAccountPanel({
   const actionType = endpoint === "/api/unfollow" ? "unfollow" : "follow";
   let accounts = [];
   let blocked = false;
+  let lastUnknownCount = 0;
+
+  function paintList() {
+    countEl.textContent = lastUnknownCount > 0
+      ? `（${accounts.length}人 ／ ${lastUnknownCount.toLocaleString()}人は確認できませんでした）`
+      : `（${accounts.length}人）`;
+    listEl.innerHTML = accounts
+      .map(
+        (account) => `
+          <li data-urlname="${escapeHtml(account.urlname)}">
+            <input type="checkbox" class="account-checkbox" data-urlname="${escapeHtml(account.urlname)}">
+            <img src="${account.profileImage || DEFAULT_AVATAR}" alt="${escapeHtml(account.name)}">
+            <a href="${account.noteUrl}" target="_blank" rel="noopener noreferrer">${escapeHtml(account.name)}</a>
+            <span class="row-status"></span>
+          </li>
+        `
+      )
+      .join("");
+    updateButtonState();
+  }
 
   toggleEl.addEventListener("click", () => {
     bodyEl.hidden = !bodyEl.hidden;
@@ -486,23 +509,23 @@ function createAccountPanel({
 
       emptyEl.hidden = true;
       sectionEl.hidden = false;
-      countEl.textContent = unknownCount > 0
-        ? `（${newAccounts.length}人 ／ ${unknownCount.toLocaleString()}人は確認できませんでした）`
-        : `（${newAccounts.length}人）`;
-      listEl.innerHTML = newAccounts
-        .map(
-          (account) => `
-          <li data-urlname="${escapeHtml(account.urlname)}">
-            <input type="checkbox" class="account-checkbox" data-urlname="${escapeHtml(account.urlname)}">
-            <img src="${account.profileImage || DEFAULT_AVATAR}" alt="${escapeHtml(account.name)}">
-            <a href="${account.noteUrl}" target="_blank" rel="noopener noreferrer">${escapeHtml(account.name)}</a>
-            <span class="row-status"></span>
-          </li>
-        `
-        )
-        .join("");
-      updateButtonState();
+      lastUnknownCount = unknownCount;
+      paintList();
       return true;
+    },
+    // 1,000人の壁の先で見つかった人を、あとから同じ一覧へ足す。
+    append(extraAccounts) {
+      const known = new Set(accounts.map((a) => a.urlname));
+      const added = extraAccounts.filter((a) => a && a.urlname && !known.has(a.urlname));
+      if (added.length === 0) return 0;
+
+      accounts = accounts.concat(added);
+      emptyEl.hidden = true;
+      sectionEl.hidden = false;
+      paintList();
+      bodyEl.hidden = false;
+      toggleEl.textContent = "隠す";
+      return added.length;
     },
     renderUnavailable(message) {
       accounts = [];
@@ -773,6 +796,8 @@ function hideAll() {
   resultEl.hidden = true;
   cappedWarning.hidden = true;
   authWarningEl.hidden = true;
+  deepSearchPanel.hidden = true;
+  deepSearchStatus.hidden = true;
   unfollowPanel.render([]);
   followPanel.render([]);
   profileCard.innerHTML = "";
@@ -867,6 +892,108 @@ function renderResult(data) {
       data.toFollowBackScope || null
     );
   }
+
+  // 壁に当たっていないなら探す先が無い。候補の照合は拡張機能からしか送れない
+  // （サーバーの1つのIPからまとめて投げるとnote.comにブロックされる）。
+  deepSearchPanel.hidden = !(data.capped && extensionBridge.available);
+  deepSearchButton.disabled = false;
+  deepSearchStatus.hidden = true;
+}
+
+// 1,000人の壁の先を探す。
+// 候補集めはサーバー（公開情報のみ・Cookie不要）、関係の判定は拡張機能から。
+// 判定は候補の人数ぶんnote.comへ問い合わせるので、サーバーからまとめて送ると
+// note.com前段のCloudFrontにIPごとブロックされる。
+deepSearchButton.addEventListener("click", async () => {
+  if (!extensionBridge.available) {
+    showDeepStatus("拡張機能が必要です。ページを再読み込みしてもう一度お試しください", true);
+    return;
+  }
+
+  deepSearchButton.disabled = true;
+  showDeepStatus("スキの履歴から候補を集めています…（1分ほどかかります）", false);
+
+  let candidates;
+  try {
+    const res = await fetch("/api/deep-candidates", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: input.value.trim(), cookieHeader: cookieInput.value.trim() }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showDeepStatus(data.error || "候補を集められませんでした", true);
+      deepSearchButton.disabled = false;
+      return;
+    }
+    candidates = data.candidates || [];
+  } catch (err) {
+    showDeepStatus("通信に失敗しました。時間をおいてもう一度お試しください", true);
+    deepSearchButton.disabled = false;
+    return;
+  }
+
+  if (candidates.length === 0) {
+    showDeepStatus("スキのやりとりから見つかる人は、すべて一覧に出ている人でした", false);
+    deepSearchButton.disabled = false;
+    return;
+  }
+
+  const estimatedMinutes = Math.max(1, Math.round((candidates.length * 0.4) / 60));
+  showDeepStatus(
+    `${candidates.length.toLocaleString()}人の候補が見つかりました。1人ずつ関係を確認します（約${estimatedMinutes}分。この画面は開いたままにしてください）`,
+    false
+  );
+
+  const oneWay = [];
+  const followBack = [];
+  let checked = 0;
+
+  try {
+    await extensionBridge.run("relations", candidates, (result) => {
+      checked += 1;
+      if (result.isFollowing && !result.isFollowed) oneWay.push(toDeepAccount(result));
+      else if (result.isFollowed && !result.isFollowing) followBack.push(toDeepAccount(result));
+      if (checked % 10 === 0 || checked === candidates.length) {
+        showDeepStatus(
+          `確認中…（${checked.toLocaleString()}/${candidates.length.toLocaleString()}人）` +
+            ` 片思い${oneWay.length}人・フォロー返し忘れ${followBack.length}人`,
+          false
+        );
+      }
+    });
+  } catch (err) {
+    showDeepStatus(err.message || "確認の途中で止まりました", true);
+    deepSearchButton.disabled = false;
+    return;
+  }
+
+  const addedOneWay = unfollowPanel.append(oneWay);
+  const addedFollowBack = followPanel.append(followBack);
+
+  showDeepStatus(
+    `${candidates.length.toLocaleString()}人を確認しました。` +
+      `隠れていた片思い${addedOneWay}人、フォロー返し忘れ${addedFollowBack}人を一覧に追加しました。` +
+      "スキのやりとりが無い人は見つけられないため、これで全員ではありません。",
+    false
+  );
+  deepSearchButton.disabled = false;
+});
+
+function toDeepAccount(result) {
+  return {
+    key: result.key,
+    urlname: result.urlname,
+    name: result.name || result.urlname,
+    profileImage: result.profileImage,
+    noteUrl: `https://note.com/${result.urlname}`,
+  };
+}
+
+function showDeepStatus(message, isError) {
+  deepSearchStatus.hidden = false;
+  deepSearchStatus.className = isError ? "status error" : "status";
+  deepSearchStatus.textContent = message;
 }
 
 function escapeHtml(str) {

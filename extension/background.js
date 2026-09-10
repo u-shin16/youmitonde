@@ -14,7 +14,10 @@
 
 const PORT_NAME = "youmitonde-action";
 const FOLLOW_API_BASE = "https://note.com/api/v3/users";
+const CREATOR_API_BASE = "https://note.com/api/v2/creators";
 const ACTION_DELAY_MS = 1200; // note.com自身の429に当たらない程度に間隔を空ける
+const RELATION_DELAY_MS = 300; // 関係を見るだけの読み取り。フォロー操作より詰めてよい
+const MAX_RELATION_TARGETS = 5000;
 const RETRY_DELAY_MS = 5000; // 429/5xxを1回だけ待って投げ直す
 const MAX_TARGETS = 500;
 const TAB_READY_TIMEOUT_MS = 20000;
@@ -32,7 +35,8 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onMessage.addListener((message) => {
     if (!message || message.type !== "action") return;
-    runAction(message, port, state).catch((err) => {
+    const job = message.action === "relations" ? runRelations : runAction;
+    job(message, port, state).catch((err) => {
       post(port, state, { type: "error", requestId: message.requestId, error: err.message });
     });
   });
@@ -73,6 +77,63 @@ async function runAction({ requestId, action, targets }, port, state) {
   }
 
   post(port, state, { type: "done", requestId });
+}
+
+// 1,000人の壁の先にいる候補について、今どういう関係かを1人ずつ見る。
+// サーバーからまとめて投げるとnote.com前段のCloudFrontにIPごとブロックされるため、
+// ここ（利用者自身のChrome）から送る。読み取りだけで、フォロー状態は変えない。
+async function runRelations({ requestId, targets }, port, state) {
+  if (!Array.isArray(targets) || targets.length === 0) throw new Error("候補がありません");
+  if (targets.length > MAX_RELATION_TARGETS) {
+    throw new Error(`一度に確認できるのは${MAX_RELATION_TARGETS}人までです`);
+  }
+
+  const tab = await acquireNoteTab();
+  try {
+    for (let index = 0; index < targets.length; index += 1) {
+      if (state.disconnected) return;
+      if (index > 0) await sleep(RELATION_DELAY_MS);
+      const result = await fetchRelation(tab.id, targets[index]);
+      post(port, state, { type: "progress", requestId, result });
+    }
+  } finally {
+    if (tab.created) {
+      try {
+        await chrome.tabs.remove(tab.id);
+      } catch (err) {
+        // 利用者が先に閉じた場合
+      }
+    }
+  }
+
+  post(port, state, { type: "done", requestId });
+}
+
+async function fetchRelation(tabId, target) {
+  const urlname = target && target.urlname;
+  if (!urlname) return { urlname: null, error: "IDが取得できませんでした" };
+
+  const url = `${CREATOR_API_BASE}/${encodeURIComponent(urlname)}`;
+  let response = await callInNoteTab(tabId, url, "GET");
+  if (response.status === 429 || (response.status >= 500 && response.status < 600)) {
+    await sleep(RETRY_DELAY_MS);
+    response = await callInNoteTab(tabId, url, "GET");
+  }
+
+  if (response.status === 404) return { urlname, gone: true };
+  if (response.status !== 200 || !response.body) {
+    return { urlname, error: describeResponse(response).error };
+  }
+
+  const data = response.body.data || {};
+  return {
+    urlname,
+    key: data.key,
+    name: data.nickname || data.name || urlname,
+    profileImage: data.userProfileImagePath,
+    isFollowing: data.isFollowing === true,
+    isFollowed: data.isFollowed === true,
+  };
 }
 
 async function acquireNoteTab() {
@@ -139,7 +200,16 @@ async function callFollowApi(url, method) {
       credentials: "include",
       headers: { "X-Requested-With": "XMLHttpRequest" },
     });
-    return { status: response.status };
+    // フォロー操作は結果の本文を使わない。関係を見るGETのときだけ読む。
+    let body = null;
+    if (method === "GET" && response.ok) {
+      try {
+        body = await response.json();
+      } catch (err) {
+        body = null;
+      }
+    }
+    return { status: response.status, body };
   } catch (err) {
     return { status: 0, error: (err && err.message) || "通信に失敗しました" };
   }
